@@ -225,18 +225,16 @@ def read_RSimages(mode, rescale=False):
     #assert mode in ['train', 'val', 'train_unchange']
     img_A_dir = os.path.join(root, mode, 'A')  # 时间点1光学图像
     img_B_dir = os.path.join(root, mode, 'B')  # 时间点2 SAR图像
-    img_C_dir = os.path.join(root, mode, 'C')  # 时间点2光学图像（如果不存在则使用A作为替代）
+    img_C_dir = os.path.join(root, mode, 'C')  # 时间点2光学图像（如果不存在则报错）
     label_A_dir = os.path.join(root, mode, 'label')
     
     data_list = os.listdir(img_A_dir)
     imgs_list_A, imgs_list_B, imgs_list_C, labels_A = [], [], [], []
     count = 0
     
-    # 检查C目录是否存在，如果不存在则使用A目录作为C
-    use_A_as_C = not os.path.exists(img_C_dir)
-    if use_A_as_C:
-        img_C_dir = img_A_dir
-        print("警告：C目录不存在，使用A目录作为时间点2光学图像")
+    # 检查C目录是否存在，如果不存在则报错
+    if not os.path.exists(img_C_dir):
+        raise ValueError("C目录不存在")
     
     for it in data_list:
         img_A_path = os.path.join(img_A_dir, it)

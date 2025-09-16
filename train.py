@@ -78,10 +78,11 @@ def main():
     
     # 检查GPU内存状态
     if torch.cuda.is_available():
-        print(f"GPU设备: {torch.cuda.get_device_name()}")
-        print(f"GPU内存: {torch.cuda.get_device_properties(0).total_memory / (1024**3):.2f} GB")
-        print(f"已分配内存: {torch.cuda.memory_allocated() / (1024**3):.2f} GB")
-        print(f"缓存内存: {torch.cuda.memory_reserved() / (1024**3):.2f} GB")
+        device = torch.cuda.current_device()  # 自动获取当前可用设备
+        print(f"GPU设备: {torch.cuda.get_device_name(device)}")
+        print(f"GPU内存: {torch.cuda.get_device_properties(device).total_memory / (1024**3):.2f} GB")
+        print(f"已分配内存: {torch.cuda.memory_allocated(device) / (1024**3):.2f} GB")
+        print(f"缓存内存: {torch.cuda.memory_reserved(device) / (1024**3):.2f} GB")
     
     net = Net(3).cuda()
     net = nn.DataParallel(net)
@@ -110,6 +111,13 @@ def main():
     print("\nFail To Load Key:", str(no_load_key)[:5000], "……\nFail To Load Key num:", len(no_load_key))
     model_dict.update(temp_dict)
     net.load_state_dict(model_dict)
+    
+    # 显示模型加载后的内存使用情况
+    device = torch.cuda.current_device()
+    print(f"\n模型加载后的内存状态:")
+    print(f"已分配内存: {torch.cuda.memory_allocated(device) / (1024**3):.2f} GB")
+    print(f"缓存内存: {torch.cuda.memory_reserved(device) / (1024**3):.2f} GB")
+    print(f"可用内存: {(torch.cuda.get_device_properties(device).total_memory - torch.cuda.memory_reserved(device)) / (1024**3):.2f} GB")
         
     train_set_change = RS.Data('train', random_flip=True)
     train_loader_change = DataLoader(train_set_change, batch_size=args['train_batch_size'], num_workers=4, shuffle=True)

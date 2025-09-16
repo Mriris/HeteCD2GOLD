@@ -35,12 +35,28 @@ def train(train_loader,train_loader_unchange, net, criterion, optimizer, schedul
         'align_base_weight': 2.0,   # 对齐损失基础权重系数
     }
     
+    # 记录权重配置到日志开头
     curr_epoch=0
+    if curr_epoch == 0:
+        with open(os.path.join(args['log_dir'] + args['log_name']), 'a') as f:
+            f.write('='*80 + '\n')
+            f.write('损失权重配置:\n')
+            for key, value in LOSS_WEIGHTS.items():
+                f.write(f'  {key}: {value}\n')
+            f.write('='*80 + '\n\n')
+    
     while True:
         net.train()
         #freeze_model(net.FCN)
         start = time.time()
         train_loss = AverageMeter()
+        # 各个损失分量的追踪器
+        train_loss_ce = AverageMeter()
+        train_loss_teacher = AverageMeter()
+        train_loss_kd = AverageMeter()
+        train_loss_align_student = AverageMeter()
+        train_loss_align_teacher = AverageMeter()
+        train_loss_dice = AverageMeter()
         curr_iter = curr_epoch*len(train_loader)
         preds_all = []
         labels_all = []
@@ -88,9 +104,11 @@ def train(train_loader,train_loader_unchange, net, criterion, optimizer, schedul
                 ) * (3.0 ** 2)
                 
                 # Dice损失
+                dice_loss_val = 0.0
                 if args['dice']:
                     loss_dice = Dice_loss(out_change, labels)
                     loss_ce = loss_ce + loss_dice
+                    dice_loss_val = loss_dice.item()
                     
                 # 动态调整对齐损失权重：训练初期权重大，后期逐渐减小
                 epoch_align_weight = (1.0 / (curr_epoch + 1)) * LOSS_WEIGHTS['align_base_weight']
@@ -102,6 +120,15 @@ def train(train_loader,train_loader_unchange, net, criterion, optimizer, schedul
                        epoch_align_weight * LOSS_WEIGHTS['align_scale_student'] * align_loss_student +
                        epoch_align_weight * LOSS_WEIGHTS['align_scale_teacher'] * align_loss_teacher)
                 
+                # 记录各个损失分量
+                train_loss_ce.update(loss_ce.item())
+                train_loss_teacher.update(loss_teacher.item())
+                train_loss_kd.update(kd_loss.item())
+                train_loss_align_student.update(align_loss_student.item())
+                train_loss_align_teacher.update(align_loss_teacher.item())
+                if args['dice']:
+                    train_loss_dice.update(dice_loss_val)
+                
             else:
                 # 推理模式：只有学生预测 + 特征
                 out_change, features = forward_result
@@ -111,14 +138,26 @@ def train(train_loader,train_loader_unchange, net, criterion, optimizer, schedul
                 loss_ce = CE_Loss(out_change, labels, cls_weights=cls_weights)
                 align_loss = al_loss(features)
                 
+                dice_loss_val = 0.0
                 if args['dice']:
                     loss_dice = Dice_loss(out_change, labels)
                     loss = loss_ce + loss_dice
+                    dice_loss_val = loss_dice.item()
                 else:
                     loss = loss_ce
                 # 动态调整对齐损失权重：训练初期权重大，后期逐渐减小
                 epoch_align_weight = (1.0 / (curr_epoch + 1)) * LOSS_WEIGHTS['align_base_weight']
                 loss = loss + epoch_align_weight * align_loss
+                
+                # 记录各个损失分量（推理模式）
+                train_loss_ce.update(loss_ce.item())
+                train_loss_align_student.update(align_loss.item())
+                if args['dice']:
+                    train_loss_dice.update(dice_loss_val)
+                # 推理模式下没有教师损失和KD损失，设为0
+                train_loss_teacher.update(0.0)
+                train_loss_kd.update(0.0)
+                train_loss_align_teacher.update(0.0)
             
             loss.backward()
             optimizer.step()
@@ -185,9 +224,37 @@ def train(train_loader,train_loader_unchange, net, criterion, optimizer, schedul
         preds_all = np.concatenate(preds_all, axis=0)
         labels_all = np.concatenate(labels_all, axis=0)   
         score_train = cm2score(get_confuse_matrix(2,labels_all, preds_all))     
+        
+        # 详细损失信息
+        loss_details = {
+            'total_loss': train_loss.average(),
+            'ce_loss': train_loss_ce.average(),
+            'teacher_loss': train_loss_teacher.average(),
+            'kd_loss': train_loss_kd.average(),
+            'align_student_loss': train_loss_align_student.average(),
+            'align_teacher_loss': train_loss_align_teacher.average()
+        }
+        if args['dice']:
+            loss_details['dice_loss'] = train_loss_dice.average()
+
+        epoch_align_weight = (1.0 / (curr_epoch + 1)) * LOSS_WEIGHTS['align_base_weight']
+        
         with open(os.path.join(args['log_dir'] + args['log_name']), 'a') as f:
             f.write('Epoch: %d  Total time: %.1fs  Train loss %.4f  score %s\n' %(curr_epoch, time.time()-begin_time,train_loss.average(),{key: score_train[key] for key in score_train}))
+            f.write('  Detailed losses: CE=%.4f, Teacher=%.4f, KD=%.4f, AlignS=%.4f, AlignT=%.4f' % (
+                train_loss_ce.average(), train_loss_teacher.average(), train_loss_kd.average(),
+                train_loss_align_student.average(), train_loss_align_teacher.average()))
+            if args['dice']:
+                f.write(', Dice=%.4f' % train_loss_dice.average())
+            f.write(', Epoch_align_weight=%.4f\n' % epoch_align_weight)
+            
         print('Epoch: %d  Total time: %.1fs  Train loss %.4f  score %s' %(curr_epoch, time.time()-begin_time, train_loss.average(),{key: score_train[key] for key in score_train}))
+        print('  Detailed losses: CE=%.4f, Teacher=%.4f, KD=%.4f, AlignS=%.4f, AlignT=%.4f' % (
+            train_loss_ce.average(), train_loss_teacher.average(), train_loss_kd.average(),
+            train_loss_align_student.average(), train_loss_align_teacher.average()), end='')
+        if args['dice']:
+            print(', Dice=%.4f' % train_loss_dice.average(), end='')
+        print(', Epoch_align_weight=%.4f' % epoch_align_weight)
 
         if score_train['iou_1']>bestiouT:
             bestiouT = score_train['iou_1']

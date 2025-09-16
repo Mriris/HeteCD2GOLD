@@ -35,8 +35,8 @@ def setup_seed(seed):
 # # 设置随机数种子
 setup_seed(seed)
 # from models.SSCDl import SSCDl as Net
-NET_NAME = 'xiongan_old'
-DATA_NAME = 'xiongan'
+NET_NAME = 'gold'
+DATA_NAME = 'trios'
 EXP_NAME = "EXP"+time.strftime('%Y%m%d%H%M%S',time.localtime(time.time()))
 ###############################################    
 #Training options
@@ -90,15 +90,15 @@ def main():
     load_key, no_load_key, temp_dict = [], [], {}
     for k, v in pretrained_dict.items():
         if "backbone" in k:
-            k1 = k.replace("backbone.", "backbone1.")
-            k2 = k.replace("backbone.", "backbone2.")
+            # 映射到光学编码器和SAR编码器
+            k1 = k.replace("backbone.", "optical_encoder.")
+            k2 = k.replace("backbone.", "sar_encoder.")
             if k1 in model_dict.keys() and np.shape(model_dict[k1]) == np.shape(v):
                 temp_dict[k1] = v
                 load_key.append(k1)
             if k2 in model_dict.keys() and np.shape(model_dict[k2]) == np.shape(v):
                 temp_dict[k2] = v
                 load_key.append(k2)
-
         else:
             no_load_key.append(k)
     model_dict.update(temp_dict)

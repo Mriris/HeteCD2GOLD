@@ -26,6 +26,15 @@ def train(train_loader,train_loader_unchange, net, criterion, optimizer, schedul
     # kl_loss = KLDivergenceLoss()
     fc_loss = FeatureConsistencyLoss()
     # criterion_sc = SCA_Loss().cuda()
+    # 训练权重配置
+    LOSS_WEIGHTS = {
+        'kd_weight': 0.1,           # 知识蒸馏权重
+        'teacher_weight': 0.1,      # 教师损失权重  
+        'align_scale_student': 1.5, # 学生特征对齐系数
+        'align_scale_teacher': 0.5, # 教师特征对齐系数
+        'align_base_weight': 2.0,   # 对齐损失基础权重系数
+    }
+    
     curr_epoch=0
     while True:
         net.train()
@@ -41,35 +50,79 @@ def train(train_loader,train_loader_unchange, net, criterion, optimizer, schedul
         for i, data in enumerate(train_loader):
             running_iter = curr_iter+i+1
             adjust_lr(optimizer, running_iter, all_iters,args)
-            imgs_A, imgs_B, labels, names = data
-            # print(imgs_A.shape, imgs_B.shape, labels.shape)
-            # print(names)
-            # print(imgs_A.shape, imgs_B.shape, labels.shape)
+            imgs_A, imgs_B, imgs_C, labels, names = data
             if args['gpu']:
                 imgs_A = imgs_A.cuda().float()
                 imgs_B = imgs_B.cuda().float()
+                imgs_C = imgs_C.cuda().float()
                 labels = labels.cuda().long()
-                # labels = labels>10
+            
             optimizer.zero_grad()
-            out_change,features = net(imgs_A, imgs_B)
-            out_change = FF.interpolate(out_change, size=(512,512), mode='bilinear', align_corners=True)
-            # print(out_change.shape)
-            # print(labels.shape)
-            cls_weights = torch.tensor([1.0, 1.0]).cuda()
-            loss_ce = CE_Loss(out_change, labels, cls_weights=cls_weights)
-            align_loss = al_loss(features)
-            # sim_loss = fc_loss(features,labels)
-            # kl_losss = kl_loss(features)
-            if args['dice']:
-                # print(out_change.shape, labels.shape)
-                loss_dice = Dice_loss(out_change, labels)
-                loss =  loss_ce + loss_dice
+            
+            # 前向传播
+            forward_result = net(imgs_A, imgs_B, imgs_C)
+            
+            if len(forward_result) == 4:
+                # 师生模式：学生预测 + 学生特征 + 教师预测 + 教师特征
+                out_change, student_features, teacher_pred, teacher_features = forward_result
+                out_change = FF.interpolate(out_change, size=(512,512), mode='bilinear', align_corners=True)
+                teacher_pred = FF.interpolate(teacher_pred, size=(512,512), mode='bilinear', align_corners=True)
+                
+                cls_weights = torch.tensor([1.0, 1.0]).cuda()
+                
+                # 学生损失（异源ab）
+                loss_ce = CE_Loss(out_change, labels, cls_weights=cls_weights)
+                
+                # 教师损失（同源ac）  
+                loss_teacher = CE_Loss(teacher_pred, labels, cls_weights=cls_weights)
+                
+                # 学生和教师的特征对齐损失
+                align_loss_student = al_loss(student_features)
+                align_loss_teacher = al_loss(teacher_features)
+                
+                # 知识蒸馏损失（学生学习教师）
+                kd_loss = F.kl_div(
+                    F.log_softmax(out_change / 3.0, dim=1),
+                    F.softmax(teacher_pred.detach() / 3.0, dim=1),
+                    reduction='batchmean'
+                ) * (3.0 ** 2)
+                
+                # Dice损失
+                if args['dice']:
+                    loss_dice = Dice_loss(out_change, labels)
+                    loss_ce = loss_ce + loss_dice
+                    
+                # 动态调整对齐损失权重：训练初期权重大，后期逐渐减小
+                epoch_align_weight = (1.0 / (curr_epoch + 1)) * LOSS_WEIGHTS['align_base_weight']
+                
+                # 总损失：学生损失 + 教师损失 + 知识蒸馏 + 特征对齐
+                loss = (loss_ce + 
+                       LOSS_WEIGHTS['teacher_weight'] * loss_teacher + 
+                       LOSS_WEIGHTS['kd_weight'] * kd_loss + 
+                       epoch_align_weight * LOSS_WEIGHTS['align_scale_student'] * align_loss_student +
+                       epoch_align_weight * LOSS_WEIGHTS['align_scale_teacher'] * align_loss_teacher)
+                
             else:
-                loss =  loss_ce
-            loss = loss  + (1/(curr_epoch+1))*2*align_loss
-            loss = loss
+                # 推理模式：只有学生预测 + 特征
+                out_change, features = forward_result
+                out_change = FF.interpolate(out_change, size=(512,512), mode='bilinear', align_corners=True)
+                
+                cls_weights = torch.tensor([1.0, 1.0]).cuda()
+                loss_ce = CE_Loss(out_change, labels, cls_weights=cls_weights)
+                align_loss = al_loss(features)
+                
+                if args['dice']:
+                    loss_dice = Dice_loss(out_change, labels)
+                    loss = loss_ce + loss_dice
+                else:
+                    loss = loss_ce
+                # 动态调整对齐损失权重：训练初期权重大，后期逐渐减小
+                epoch_align_weight = (1.0 / (curr_epoch + 1)) * LOSS_WEIGHTS['align_base_weight']
+                loss = loss + epoch_align_weight * align_loss
+            
             loss.backward()
             optimizer.step()
+            
             preds = torch.argmax(out_change, dim=1)
             pred_numpy = preds.cpu().numpy()
             labels_numpy = labels.cpu().numpy()
@@ -176,18 +229,29 @@ def validate(val_loader, net, criterion, curr_epoch, args):
     labels_all = []
     names_all = []
     for vi, data in enumerate(val_loader):
-        imgs_A, imgs_B, labels, names = data
+        imgs_A, imgs_B, imgs_C, labels, names = data
         
         cls_weights = torch.tensor([0.1, 0.9]).cuda()
         if args['gpu']:
             imgs_A = imgs_A.cuda().float()
             imgs_B = imgs_B.cuda().float()
+            imgs_C = imgs_C.cuda().float()
             labels = labels.cuda().long()
         with torch.no_grad():
-            out_change,features = net(imgs_A, imgs_B)
+            # 验证时可能返回2个或4个值
+            forward_result = net(imgs_A, imgs_B, imgs_C)
+            
+            if len(forward_result) == 4:
+                # 师生模式：使用学生预测进行验证
+                out_change, student_features, teacher_pred, teacher_features = forward_result
+            else:
+                # 仅学生模式
+                out_change, features = forward_result
+                
             out_change = FF.interpolate(out_change, size=(512,512), mode='bilinear', align_corners=True)
-            loss_bn = CE_Loss(out_change, labels,cls_weights)
-            loss =  loss_bn
+            loss_bn = CE_Loss(out_change, labels, cls_weights)
+            loss = loss_bn
+            
         val_loss.update(loss.cpu().detach().numpy())
         
         preds = torch.argmax(out_change, dim=1)

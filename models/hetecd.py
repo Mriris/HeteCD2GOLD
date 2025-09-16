@@ -1508,49 +1508,69 @@ class hetecd(nn.Module):
 
     def __init__(self, input_nc=3, output_nc=2, decoder_softmax=False, embed_dim=256):
         super(hetecd, self).__init__()
-        #Transformer Encoder
+        # Transformer Encoder
         self.embed_dims = [64, 128, 320, 512]
-        self.depths     = [3, 4, 6, 3] #[3, 3, 6, 18, 3]
+        self.depths     = [3, 4, 6, 3]
         self.embedding_dim = embed_dim
         self.drop_rate = 0.2
         self.attn_drop = 0.2
         self.drop_path_rate = 0.2 
-        self.backbone1 = Backbone( patch_size = 7, in_chans=input_nc, num_classes=output_nc, embed_dims=self.embed_dims,
+        
+        # 光学图像编码器（处理a和c，共享权重）
+        self.optical_encoder = Backbone(patch_size = 7, in_chans=input_nc, num_classes=output_nc, embed_dims=self.embed_dims,
                  num_heads = [1, 2, 5, 8], mlp_ratios=[4, 4, 4, 4], qkv_bias=True, qk_scale=None, drop_rate=self.drop_rate,
                  attn_drop_rate = self.attn_drop, drop_path_rate=self.drop_path_rate, norm_layer=partial(nn.LayerNorm, eps=1e-6),
                  depths=self.depths, sr_ratios=[8, 4, 2, 1])
-        self.backbone2 = Backbone( patch_size = 7, in_chans=input_nc, num_classes=output_nc, embed_dims=self.embed_dims,
+        
+        # SAR图像编码器（处理b）
+        self.sar_encoder = Backbone(patch_size = 7, in_chans=input_nc, num_classes=output_nc, embed_dims=self.embed_dims,
                  num_heads = [1, 2, 5, 8], mlp_ratios=[4, 4, 4, 4], qkv_bias=True, qk_scale=None, drop_rate=self.drop_rate,
                  attn_drop_rate = self.attn_drop, drop_path_rate=self.drop_path_rate, norm_layer=partial(nn.LayerNorm, eps=1e-6),
                  depths=self.depths, sr_ratios=[8, 4, 2, 1])
-        self.vae1 = ShallowResNet()
-        self.vae2 = ShallowResNet()
-        # self.vae1.apply(self.init_weights)
-        # self.vae2.apply(self.init_weights)
-        self.CD_Decoder   = CD_3D_Decoder(input_transform='multiple_select', in_index=[0, 1, 2, 3], align_corners=False, 
+        
+        # 学生解码器（异源变化检测：ab）
+        self.CD_Decoder = CD_3D_Decoder(input_transform='multiple_select', in_index=[0, 1, 2, 3], align_corners=False, 
                     in_channels = self.embed_dims, embedding_dim= self.embedding_dim, output_nc=output_nc, 
                     decoder_softmax = decoder_softmax, feature_strides=[2, 4, 8, 16])
         
-    # def init_weights(m):
-    #     if isinstance(m, nn.Conv2d) or isinstance(m, nn.ConvTranspose2d):
-    #         nn.init.normal_(m.weight, mean=0.0, std=0.02)
-    #         if m.bias is not None:
-    #             nn.init.constant_(m.bias, 0)
-    #     elif isinstance(m, nn.Linear):
-    #         nn.init.xavier_uniform_(m.weight)
-    #         if m.bias is not None:
-    #             nn.init.constant_(m.bias, 0)
-    def forward(self, x1, x2):
+        # 教师解码器（同源变化检测：ac，用于知识蒸馏）
+        self.teacher_decoder = CD_3D_Decoder(input_transform='multiple_select', in_index=[0, 1, 2, 3], align_corners=False, 
+                    in_channels = self.embed_dims, embedding_dim= self.embedding_dim, output_nc=output_nc, 
+                    decoder_softmax = decoder_softmax, feature_strides=[2, 4, 8, 16])
+        
+        # 训练模式标志
+        self.use_teacher = True
+    
+    def forward(self, x1, x2, x3=None):
+        """
+        师生网络异源变化检测
+        Args:
+            x1: 时间点1光学图像
+            x2: 时间点2 SAR图像  
+            x3: 时间点2光学图像（可选，仅训练时使用）
+        Returns:
+            训练时（有x3）: student_pred, features, teacher_pred
+            推理时（无x3）: student_pred, features
+        """
         x_size = x1.size() 
-        # print(x_size)
-        # x1 = self.vae1(x1)
-        # x2= self.vae1(x2)
-        # print(x1.size())
-        [fx1, fx2] = [self.backbone1(x1), self.backbone2(x2)]
+        [fx1, fx2] = [self.optical_encoder(x1), self.sar_encoder(x2)]
         c1_1, c2_1, c3_1, c4_1 = fx1
         c1_2, c2_2, c3_2, c4_2 = fx2
+        
+        # 学生网络：异源变化检测 (x1光学 -> x2 SAR)
         cp = self.CD_Decoder(fx1, fx2)
-
-        return F.interpolate(cp[-1], size=x_size[2:], mode='bilinear', align_corners=False),[[c3_1,c4_1],[c3_2, c4_2]]
+        student_pred = F.interpolate(cp[-1], size=x_size[2:], mode='bilinear', align_corners=False)
+        
+        # 如果有第三个输入且在训练模式，使用教师网络
+        if x3 is not None and self.training and self.use_teacher:
+            fx3 = self.optical_encoder(x3)  # 时间点2光学特征
+            c1_3, c2_3, c3_3, c4_3 = fx3
+            teacher_output = self.teacher_decoder(fx1, fx3)  
+            teacher_pred = F.interpolate(teacher_output[-1], size=x_size[2:], mode='bilinear', align_corners=False)
+            
+            # 返回格式：学生预测, 学生特征, 教师预测, 教师特征
+            return student_pred, [[c3_1, c4_1], [c3_2, c4_2]], teacher_pred, [[c3_1, c4_1], [c3_3, c4_3]]
+        else:
+            return student_pred, [[c3_1, c4_1], [c3_2, c4_2]]
 
 

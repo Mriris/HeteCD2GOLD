@@ -223,24 +223,29 @@ def normalize_image(im, time='A'):
 
 def read_RSimages(mode, rescale=False):
     #assert mode in ['train', 'val', 'train_unchange']
-    img_A_dir = os.path.join(root, mode, 'A')
-    img_B_dir = os.path.join(root, mode, 'B')
+    img_A_dir = os.path.join(root, mode, 'A')  # 时间点1光学图像
+    img_B_dir = os.path.join(root, mode, 'B')  # 时间点2 SAR图像
+    img_C_dir = os.path.join(root, mode, 'C')  # 时间点2光学图像（如果不存在则使用A作为替代）
     label_A_dir = os.path.join(root, mode, 'label')
-    # To use rgb labels:
-    #label_A_dir = os.path.join(root, mode, 'label1_rgb')
-    #label_B_dir = os.path.join(root, mode, 'label2_rgb')
     
     data_list = os.listdir(img_A_dir)
-    imgs_list_A, imgs_list_B, labels_A, labels_B = [], [], [], []
+    imgs_list_A, imgs_list_B, imgs_list_C, labels_A = [], [], [], []
     count = 0
+    
+    # 检查C目录是否存在，如果不存在则使用A目录作为C
+    use_A_as_C = not os.path.exists(img_C_dir)
+    if use_A_as_C:
+        img_C_dir = img_A_dir
+        print("警告：C目录不存在，使用A目录作为时间点2光学图像")
+    
     for it in data_list:
-        # print(it)
-        # if (it[-4:]=='.tif'):
         img_A_path = os.path.join(img_A_dir, it)
         img_B_path = os.path.join(img_B_dir, it)
+        img_C_path = os.path.join(img_C_dir, it)
         label_A_path = os.path.join(label_A_dir, it)
         imgs_list_A.append(img_A_path)
         imgs_list_B.append(img_B_path)
+        imgs_list_C.append(img_C_path)
         label_A = io.imread(label_A_path)
         labels_A.append(label_A)
         count+=1
@@ -249,12 +254,12 @@ def read_RSimages(mode, rescale=False):
     print(labels_A[0].shape)
     print(str(len(imgs_list_A)) + ' ' + mode + ' images' + ' loaded.')
     
-    return imgs_list_A, imgs_list_B, labels_A
+    return imgs_list_A, imgs_list_B, imgs_list_C, labels_A
 
 class Data(data.Dataset):
     def __init__(self, mode, random_flip = False):
         self.random_flip = random_flip
-        self.imgs_list_A, self.imgs_list_B, self.labels = read_RSimages(mode)
+        self.imgs_list_A, self.imgs_list_B, self.imgs_list_C, self.labels = read_RSimages(mode)
         self.mode = mode
         self.augm = CDDataAugmentation(
                     img_size=512,
@@ -269,21 +274,21 @@ class Data(data.Dataset):
         return mask_name
 
     def __getitem__(self, idx):
-        img_A = io.imread(self.imgs_list_A[idx])
+        img_A = io.imread(self.imgs_list_A[idx])  # 时间点1光学图像
+        img_B = io.imread(self.imgs_list_B[idx])  # 时间点2 SAR图像
+        img_C = io.imread(self.imgs_list_C[idx])  # 时间点2光学图像
         name = self.imgs_list_A[idx].split('/')[-1].replace('.tif','.png')
-        img_B = io.imread(self.imgs_list_B[idx])
         label= self.labels[idx]//255
+        
         if self.mode=="train":
-            [img_A, img_B], [label] = self.augm.transform([img_A, img_B], [label])
+            [img_A, img_B, img_C], [label] = self.augm.transform([img_A, img_B, img_C], [label])
         else:
             img_A = F.to_tensor(img_A)
             img_B = F.to_tensor(img_B)
+            img_C = F.to_tensor(img_C)
             label = torch.from_numpy(np.array(label, np.uint8)).unsqueeze(dim=0)
         
-        # img_B = img_B/255
-        # img_A = img_A/255  
-
-        return img_A, img_B, label.squeeze(), name
+        return img_A, img_B, img_C, label.squeeze(), name
 
     def __len__(self):
         return len(self.imgs_list_A)

@@ -384,7 +384,7 @@ def make_one_hot(input, num_classes):
 
 
 class BinaryDiceLoss(nn.Module):
-    """Dice loss of binary class
+    r"""Dice loss of binary class
     Args:
         smooth: A float number to smooth loss, and avoid NaN error, default: 1
         p: Denominator value: \sum{x^p} + \sum{y^p}, default: 2

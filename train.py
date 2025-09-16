@@ -7,13 +7,14 @@ import torch.autograd
 from skimage import io
 from torch import optim
 import torch.nn.functional as F
+import torch
 from tensorboardX import SummaryWriter
 from torch.utils.data import DataLoader
 working_path = os.path.dirname(os.path.abspath(__file__))
 from utils.utils_fit import train
 from utils.loss import CrossEntropyLoss2d, weighted_BCE_logits, ChangeSimilarity,SCA_Loss,FeatureConsistencyLoss
 from utils.utils import accuracy, SCDD_eval_all, AverageMeter, get_confuse_matrix, cm2score
-os.environ['CUDA_VISIBLE_DEVICES'] = '1'
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 #Data and model choose
 torch.set_num_threads(4)
 
@@ -44,8 +45,8 @@ args = {
     'net_name': NET_NAME,
     'data_name': DATA_NAME,
     'exp_name':EXP_NAME,
-    'train_batch_size': 8,
-    'val_batch_size': 8,
+    'train_batch_size': 4,
+    'val_batch_size': 4,
     'dice': True,
     'lr': 0.0005,
     'epochs': 200,
@@ -69,6 +70,19 @@ if not os.path.exists(args['chkpt_dir']): os.makedirs(args['chkpt_dir'])
 #日期时间作为日志文件名
 args['log_name']="/log.txt"
 def main():        
+    # 清空GPU缓存
+    torch.cuda.empty_cache()
+    # 设置内存分配策略
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.enabled = True
+    
+    # 检查GPU内存状态
+    if torch.cuda.is_available():
+        print(f"GPU设备: {torch.cuda.get_device_name()}")
+        print(f"GPU内存: {torch.cuda.get_device_properties(0).total_memory / (1024**3):.2f} GB")
+        print(f"已分配内存: {torch.cuda.memory_allocated() / (1024**3):.2f} GB")
+        print(f"缓存内存: {torch.cuda.memory_reserved() / (1024**3):.2f} GB")
+    
     net = Net(3).cuda()
     net = nn.DataParallel(net)
     model_dict      = net.state_dict()

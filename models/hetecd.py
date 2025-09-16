@@ -8,7 +8,7 @@ from torchvision.models import resnet18
 import torch.nn.functional as F
 import warnings
 import timm
-from timm.models.layers import DropPath, to_2tuple, trunc_normal_
+from timm.layers import DropPath, to_2tuple, trunc_normal_
 import types
 import math
 from abc import ABCMeta, abstractmethod
@@ -498,7 +498,7 @@ class MLP_PRED(nn.Module):
     def __init__(self, input_dim=2048, embed_dim=768):
         super().__init__()
         self.proj = nn.Linear(input_dim, embed_dim)
-        self.dropout = nn.Dropout2d(0.1)
+        self.dropout = nn.Dropout(0.1)
     def forward(self, x):
         
         x = x.flatten(2).transpose(1, 2)
@@ -1551,6 +1551,6 @@ class hetecd(nn.Module):
         c1_2, c2_2, c3_2, c4_2 = fx2
         cp = self.CD_Decoder(fx1, fx2)
 
-        return F.upsample(cp[-1], x_size[2:], mode='bilinear'),[[c3_1,c4_1],[c3_2, c4_2]]
+        return F.interpolate(cp[-1], size=x_size[2:], mode='bilinear', align_corners=False),[[c3_1,c4_1],[c3_2, c4_2]]
 
 

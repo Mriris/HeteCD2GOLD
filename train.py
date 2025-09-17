@@ -14,7 +14,7 @@ working_path = os.path.dirname(os.path.abspath(__file__))
 from utils.utils_fit import train
 from utils.loss import CrossEntropyLoss2d, weighted_BCE_logits, ChangeSimilarity,SCA_Loss,FeatureConsistencyLoss
 from utils.utils import accuracy, SCDD_eval_all, AverageMeter, get_confuse_matrix, cm2score
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+os.environ['CUDA_VISIBLE_DEVICES'] = '2'
 #Data and model choose
 torch.set_num_threads(4)
 

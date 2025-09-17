@@ -26,6 +26,7 @@ DEFAULT_LOSS_WEIGHTS = {
     'kd_warmup_epochs': 12,
     'kd_loss_clip': 50.0,
     'teacher_weight': 0.04,
+    'teacher_warmup_epochs': 8,
     'align_scale_student': 0.3,
     'align_scale_teacher': 0.2,
     'align_base_weight': 0.5,
@@ -42,6 +43,17 @@ def _compute_kd_weight(epoch: int, loss_weights: dict) -> float:
     else:
         scale = 1.0
     return loss_weights['kd_weight'] * scale
+
+
+def _compute_teacher_weight(epoch: int, loss_weights: dict) -> float:
+    """根据epoch返回教师分支的动态权重。"""
+    warmup = loss_weights.get('teacher_warmup_epochs', 0)
+    base = loss_weights.get('teacher_weight', 0.0)
+    if warmup and warmup > 0:
+        scale = min(1.0, (epoch + 1) / float(warmup))
+    else:
+        scale = 1.0
+    return base * scale
 
 
 def _make_class_weights(loss_weights: dict, device: torch.device) -> torch.Tensor:
@@ -92,6 +104,8 @@ def train(train_loader,train_loader_unchange, net, criterion, optimizer, schedul
         train_loss_dice = AverageMeter()
         curr_iter = curr_epoch*len(train_loader)
         kd_lambda = _compute_kd_weight(curr_epoch, LOSS_WEIGHTS)
+        teacher_lambda = _compute_teacher_weight(curr_epoch, LOSS_WEIGHTS)
+        epoch_align_weight = (1.0 / (curr_epoch + 1)) * LOSS_WEIGHTS['align_base_weight']
         preds_all = []
         labels_all = []
         names_all = []
@@ -132,15 +146,18 @@ def train(train_loader,train_loader_unchange, net, criterion, optimizer, schedul
                 
                 # 知识蒸馏损失（学生学习教师）
                 temperature = LOSS_WEIGHTS['temperature']
-                kd_loss = F.kl_div(
-                    F.log_softmax(out_change / temperature, dim=1),
-                    F.softmax(teacher_pred.detach() / temperature, dim=1),
-                    reduction='batchmean'
-                ) * temperature
+                student_log_prob = F.log_softmax(out_change / temperature, dim=1)
+                teacher_prob = F.softmax(teacher_pred.detach() / temperature, dim=1)
+                kd_loss_map = F.kl_div(
+                    student_log_prob,
+                    teacher_prob,
+                    reduction='none'
+                )
+                kd_loss = kd_loss_map.sum(dim=1).mean() * (temperature ** 2)
                 kd_clip = LOSS_WEIGHTS.get('kd_loss_clip')
                 if kd_clip is not None:
                     kd_loss = torch.clamp(kd_loss, max=kd_clip)
-                
+
                 # Dice损失
                 dice_loss_val = 0.0
                 if args['dice']:
@@ -149,11 +166,9 @@ def train(train_loader,train_loader_unchange, net, criterion, optimizer, schedul
                     dice_loss_val = loss_dice.item()
                     
                 # 动态调整对齐损失权重：训练初期权重大，后期逐渐减小
-                epoch_align_weight = (1.0 / (curr_epoch + 1)) * LOSS_WEIGHTS['align_base_weight']
-                
                 # 总损失：学生损失 + 教师损失 + 知识蒸馏 + 特征对齐
                 loss = (loss_ce + 
-                       LOSS_WEIGHTS['teacher_weight'] * loss_teacher + 
+                       teacher_lambda * loss_teacher + 
                        kd_lambda * kd_loss + 
                        epoch_align_weight * LOSS_WEIGHTS['align_scale_student'] * align_loss_student +
                        epoch_align_weight * LOSS_WEIGHTS['align_scale_teacher'] * align_loss_teacher)
@@ -184,7 +199,6 @@ def train(train_loader,train_loader_unchange, net, criterion, optimizer, schedul
                 else:
                     loss = loss_ce
                 # 动态调整对齐损失权重：训练初期权重大，后期逐渐减小
-                epoch_align_weight = (1.0 / (curr_epoch + 1)) * LOSS_WEIGHTS['align_base_weight']
                 loss = loss + epoch_align_weight * align_loss
                 
                 # 记录各个损失分量（推理模式）
@@ -276,7 +290,7 @@ def train(train_loader,train_loader_unchange, net, criterion, optimizer, schedul
             loss_details['dice_loss'] = train_loss_dice.average()
 
         epoch_align_weight = (1.0 / (curr_epoch + 1)) * LOSS_WEIGHTS['align_base_weight']
-        
+
         with open(os.path.join(args['log_dir'] + args['log_name']), 'a') as f:
             f.write('Epoch: %d  Total time: %.1fs  Train loss %.4f  score %s\n' %(curr_epoch, time.time()-begin_time,train_loss.average(),{key: score_train[key] for key in score_train}))
             f.write('  Detailed losses: CE=%.4f, Teacher=%.4f, KD=%.4f, AlignS=%.4f, AlignT=%.4f' % (
@@ -284,15 +298,15 @@ def train(train_loader,train_loader_unchange, net, criterion, optimizer, schedul
                 train_loss_align_student.average(), train_loss_align_teacher.average()))
             if args['dice']:
                 f.write(', Dice=%.4f' % train_loss_dice.average())
-            f.write(', Epoch_align_weight=%.4f, Epoch_kd_weight=%.6f\n' % (epoch_align_weight, kd_lambda))
-            
+            f.write(', Epoch_align_weight=%.4f, Epoch_teacher_weight=%.6f, Epoch_kd_weight=%.6f\n' % (epoch_align_weight, teacher_lambda, kd_lambda))
+
         print('Epoch: %d  Total time: %.1fs  Train loss %.4f  score %s' %(curr_epoch, time.time()-begin_time, train_loss.average(),{key: score_train[key] for key in score_train}))
         print('  Detailed losses: CE=%.4f, Teacher=%.4f, KD=%.4f, AlignS=%.4f, AlignT=%.4f' % (
             train_loss_ce.average(), train_loss_teacher.average(), train_loss_kd.average(),
             train_loss_align_student.average(), train_loss_align_teacher.average()), end='')
         if args['dice']:
             print(', Dice=%.4f' % train_loss_dice.average(), end='')
-        print(', Epoch_align_weight=%.4f, Epoch_kd_weight=%.6f' % (epoch_align_weight, kd_lambda))
+        print(', Epoch_align_weight=%.4f, Epoch_teacher_weight=%.6f, Epoch_kd_weight=%.6f' % (epoch_align_weight, teacher_lambda, kd_lambda))
 
         if score_train['iou_1']>bestiouT:
             bestiouT = score_train['iou_1']

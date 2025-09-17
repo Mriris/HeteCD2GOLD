@@ -1,11 +1,16 @@
 import os
 import time
 import random
+import warnings
 import numpy as np
+import torch
 import torch.nn as nn
 import torch.autograd
 from skimage import io
 from torch import optim
+
+# 抑制 scikit-image 的低对比度警告
+warnings.filterwarnings("ignore", message=".*low contrast image.*")
 import torch.nn.functional as F
 from tensorboardX import SummaryWriter
 from torch.utils.data import DataLoader
@@ -14,6 +19,37 @@ import copy
 from utils.loss import CE_Loss, AlignmentLoss, ChangeSimilarity,Dice_loss, KLDivergenceLoss,FeatureConsistencyLoss
 from utils.utils import accuracy, SCDD_eval_all, AverageMeter, get_confuse_matrix, cm2score
 import torch.nn.functional as FF
+
+# 损失权重配置
+DEFAULT_LOSS_WEIGHTS = {
+    'kd_weight': 5e-4,
+    'kd_warmup_epochs': 12,
+    'kd_loss_clip': 50.0,
+    'teacher_weight': 0.04,
+    'align_scale_student': 0.3,
+    'align_scale_teacher': 0.2,
+    'align_base_weight': 0.5,
+    'temperature': 8.0,
+    'ce_class_weights': (0.2, 0.8),
+}
+
+
+def _compute_kd_weight(epoch: int, loss_weights: dict) -> float:
+    """Return epoch-specific KD multiplier with optional warm-up."""
+    warmup = loss_weights.get('kd_warmup_epochs', 0)
+    if warmup and warmup > 0:
+        scale = min(1.0, (epoch + 1) / float(warmup))
+    else:
+        scale = 1.0
+    return loss_weights['kd_weight'] * scale
+
+
+def _make_class_weights(loss_weights: dict, device: torch.device) -> torch.Tensor:
+    """Create class weights tensor for CE loss on the desired device."""
+    weights = loss_weights.get('ce_class_weights', (1.0, 1.0))
+    return torch.tensor(weights, dtype=torch.float32, device=device)
+
+
 def train(train_loader,train_loader_unchange, net, criterion, optimizer, scheduler, val_loader, args):
     NET_NAME = args['net_name']
     bestiouT=0
@@ -27,15 +63,12 @@ def train(train_loader,train_loader_unchange, net, criterion, optimizer, schedul
     fc_loss = FeatureConsistencyLoss()
     # criterion_sc = SCA_Loss().cuda()
     # 训练权重配置
-    LOSS_WEIGHTS = {
-        'kd_weight': 0.1,           # 知识蒸馏权重
-        'teacher_weight': 0.1,      # 教师损失权重  
-        'align_scale_student': 1.5, # 学生特征对齐系数
-        'align_scale_teacher': 0.5, # 教师特征对齐系数
-        'align_base_weight': 2.0,   # 对齐损失基础权重系数
-    }
+    LOSS_WEIGHTS = copy.deepcopy(DEFAULT_LOSS_WEIGHTS)
+    LOSS_WEIGHTS.update(args.get('loss_weights', {}))
     
     # 记录权重配置到日志开头
+    args['loss_weights'] = LOSS_WEIGHTS
+
     curr_epoch=0
     if curr_epoch == 0:
         with open(os.path.join(args['log_dir'] + args['log_name']), 'a') as f:
@@ -58,6 +91,7 @@ def train(train_loader,train_loader_unchange, net, criterion, optimizer, schedul
         train_loss_align_teacher = AverageMeter()
         train_loss_dice = AverageMeter()
         curr_iter = curr_epoch*len(train_loader)
+        kd_lambda = _compute_kd_weight(curr_epoch, LOSS_WEIGHTS)
         preds_all = []
         labels_all = []
         names_all = []
@@ -84,7 +118,7 @@ def train(train_loader,train_loader_unchange, net, criterion, optimizer, schedul
                 out_change = FF.interpolate(out_change, size=(512,512), mode='bilinear', align_corners=True)
                 teacher_pred = FF.interpolate(teacher_pred, size=(512,512), mode='bilinear', align_corners=True)
                 
-                cls_weights = torch.tensor([1.0, 1.0]).cuda()
+                cls_weights = _make_class_weights(LOSS_WEIGHTS, labels.device)
                 
                 # 学生损失（异源ab）
                 loss_ce = CE_Loss(out_change, labels, cls_weights=cls_weights)
@@ -97,11 +131,15 @@ def train(train_loader,train_loader_unchange, net, criterion, optimizer, schedul
                 align_loss_teacher = al_loss(teacher_features)
                 
                 # 知识蒸馏损失（学生学习教师）
+                temperature = LOSS_WEIGHTS['temperature']
                 kd_loss = F.kl_div(
-                    F.log_softmax(out_change / 3.0, dim=1),
-                    F.softmax(teacher_pred.detach() / 3.0, dim=1),
+                    F.log_softmax(out_change / temperature, dim=1),
+                    F.softmax(teacher_pred.detach() / temperature, dim=1),
                     reduction='batchmean'
-                ) * (3.0 ** 2)
+                ) * temperature
+                kd_clip = LOSS_WEIGHTS.get('kd_loss_clip')
+                if kd_clip is not None:
+                    kd_loss = torch.clamp(kd_loss, max=kd_clip)
                 
                 # Dice损失
                 dice_loss_val = 0.0
@@ -116,7 +154,7 @@ def train(train_loader,train_loader_unchange, net, criterion, optimizer, schedul
                 # 总损失：学生损失 + 教师损失 + 知识蒸馏 + 特征对齐
                 loss = (loss_ce + 
                        LOSS_WEIGHTS['teacher_weight'] * loss_teacher + 
-                       LOSS_WEIGHTS['kd_weight'] * kd_loss + 
+                       kd_lambda * kd_loss + 
                        epoch_align_weight * LOSS_WEIGHTS['align_scale_student'] * align_loss_student +
                        epoch_align_weight * LOSS_WEIGHTS['align_scale_teacher'] * align_loss_teacher)
                 
@@ -134,7 +172,7 @@ def train(train_loader,train_loader_unchange, net, criterion, optimizer, schedul
                 out_change, features = forward_result
                 out_change = FF.interpolate(out_change, size=(512,512), mode='bilinear', align_corners=True)
                 
-                cls_weights = torch.tensor([1.0, 1.0]).cuda()
+                cls_weights = _make_class_weights(LOSS_WEIGHTS, labels.device)
                 loss_ce = CE_Loss(out_change, labels, cls_weights=cls_weights)
                 align_loss = al_loss(features)
                 
@@ -246,7 +284,7 @@ def train(train_loader,train_loader_unchange, net, criterion, optimizer, schedul
                 train_loss_align_student.average(), train_loss_align_teacher.average()))
             if args['dice']:
                 f.write(', Dice=%.4f' % train_loss_dice.average())
-            f.write(', Epoch_align_weight=%.4f\n' % epoch_align_weight)
+            f.write(', Epoch_align_weight=%.4f, Epoch_kd_weight=%.6f\n' % (epoch_align_weight, kd_lambda))
             
         print('Epoch: %d  Total time: %.1fs  Train loss %.4f  score %s' %(curr_epoch, time.time()-begin_time, train_loss.average(),{key: score_train[key] for key in score_train}))
         print('  Detailed losses: CE=%.4f, Teacher=%.4f, KD=%.4f, AlignS=%.4f, AlignT=%.4f' % (
@@ -254,7 +292,7 @@ def train(train_loader,train_loader_unchange, net, criterion, optimizer, schedul
             train_loss_align_student.average(), train_loss_align_teacher.average()), end='')
         if args['dice']:
             print(', Dice=%.4f' % train_loss_dice.average(), end='')
-        print(', Epoch_align_weight=%.4f' % epoch_align_weight)
+        print(', Epoch_align_weight=%.4f, Epoch_kd_weight=%.6f' % (epoch_align_weight, kd_lambda))
 
         if score_train['iou_1']>bestiouT:
             bestiouT = score_train['iou_1']
@@ -292,18 +330,19 @@ def validate(val_loader, net, criterion, curr_epoch, args):
     val_loss = AverageMeter()
 
 
+    loss_weights = args.get('loss_weights', DEFAULT_LOSS_WEIGHTS)
+
     preds_all = []
     labels_all = []
     names_all = []
     for vi, data in enumerate(val_loader):
         imgs_A, imgs_B, imgs_C, labels, names = data
-        
-        cls_weights = torch.tensor([0.1, 0.9]).cuda()
         if args['gpu']:
             imgs_A = imgs_A.cuda().float()
             imgs_B = imgs_B.cuda().float()
             imgs_C = imgs_C.cuda().float()
             labels = labels.cuda().long()
+        cls_weights = _make_class_weights(loss_weights, labels.device)
         with torch.no_grad():
             # 验证时可能返回2个或4个值
             forward_result = net(imgs_A, imgs_B, imgs_C)

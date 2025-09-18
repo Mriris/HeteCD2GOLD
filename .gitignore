@@ -1,3 +1,6 @@
 *.pth
 *__pycache__*
 checkpoints/
+.idea/
+doc/personal/
+AGENTS.md

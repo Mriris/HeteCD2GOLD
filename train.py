@@ -35,8 +35,8 @@ def setup_seed(seed):
 # # 设置随机数种子
 setup_seed(seed)
 # from models.SSCDl import SSCDl as Net
-NET_NAME = 'xiongan_old'
-DATA_NAME = 'xiongan'
+NET_NAME = 'HeteCD'
+DATA_NAME = 'gold31'
 EXP_NAME = "EXP"+time.strftime('%Y%m%d%H%M%S',time.localtime(time.time()))
 ###############################################    
 #Training options
@@ -49,7 +49,7 @@ args = {
     'val_batch_size': 4,
     'dice': True,
     'lr': 0.0005,
-    'epochs': 200,
+    'epochs': 400,
     'gpu': True,
     'lr_decay_power': 1.5,
     'weight_decay': 1e-2,

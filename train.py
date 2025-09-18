@@ -14,7 +14,7 @@ working_path = os.path.dirname(os.path.abspath(__file__))
 from utils.utils_fit import train
 from utils.loss import CrossEntropyLoss2d, weighted_BCE_logits, ChangeSimilarity,SCA_Loss,FeatureConsistencyLoss
 from utils.utils import accuracy, SCDD_eval_all, AverageMeter, get_confuse_matrix, cm2score
-os.environ['CUDA_VISIBLE_DEVICES'] = '2'
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 #Data and model choose
 torch.set_num_threads(4)
 
@@ -35,7 +35,7 @@ def setup_seed(seed):
 # # 设置随机数种子
 setup_seed(seed)
 # from models.SSCDl import SSCDl as Net
-NET_NAME = 'gold'
+NET_NAME = 'gold31'
 DATA_NAME = 'trios'
 EXP_NAME = "EXP"+time.strftime('%Y%m%d%H%M%S',time.localtime(time.time()))
 ###############################################    
@@ -49,7 +49,7 @@ args = {
     'val_batch_size': 4,
     'dice': True,
     'lr': 0.0005,
-    'epochs': 200,
+    'epochs': 400,
     'gpu': True,
     'lr_decay_power': 1.5,
     'weight_decay': 1e-2,

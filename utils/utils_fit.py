@@ -22,16 +22,16 @@ import torch.nn.functional as FF
 
 # 损失权重配置
 DEFAULT_LOSS_WEIGHTS = {
-    'kd_weight': 5e-4,
+    'kd_weight': 5e-3,
     'kd_warmup_epochs': 12,
     'kd_loss_clip': 50.0,
-    'teacher_weight': 0.04,
+    'teacher_weight': 0.12,
     'teacher_warmup_epochs': 8,
     'align_scale_student': 0.3,
     'align_scale_teacher': 0.2,
     'align_base_weight': 0.5,
     'temperature': 8.0,
-    'ce_class_weights': (0.2, 0.8),
+    'ce_class_weights': (1.0, 1.0),
 }
 
 

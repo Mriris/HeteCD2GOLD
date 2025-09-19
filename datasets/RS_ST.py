@@ -22,7 +22,7 @@ STD_A  = np.array([48.30,  46.27,  48.14])
 MEAN_B = np.array([111.07, 111.07, 111.07])
 STD_B  = np.array([49.41,  49.41,  49.41])
 
-root = '/data/jingwei/yantingxuan/Datasets/CityCN/Split31'
+root = '/data/jingwei/yantingxuan/Datasets/CityCN/Split38'
 
 class CDDataAugmentation:
 

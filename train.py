@@ -14,7 +14,7 @@ working_path = os.path.dirname(os.path.abspath(__file__))
 from utils.utils_fit import train
 from utils.loss import CrossEntropyLoss2d, weighted_BCE_logits, ChangeSimilarity,SCA_Loss,FeatureConsistencyLoss
 from utils.utils import accuracy, SCDD_eval_all, AverageMeter, get_confuse_matrix, cm2score
-os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+os.environ['CUDA_VISIBLE_DEVICES'] = '1'
 #Data and model choose
 torch.set_num_threads(4)
 
@@ -36,7 +36,7 @@ def setup_seed(seed):
 setup_seed(seed)
 # from models.SSCDl import SSCDl as Net
 NET_NAME = 'HeteCD'
-DATA_NAME = 'gold31'
+DATA_NAME = 'gold32'
 EXP_NAME = "EXP"+time.strftime('%Y%m%d%H%M%S',time.localtime(time.time()))
 ###############################################    
 #Training options

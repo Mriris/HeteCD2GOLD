@@ -12,7 +12,7 @@ import os
 import glob
 import random
 import gc
-from typing import Dict, List, Tuple, Optional, NamedTuple
+from typing import Dict, List, Tuple, Optional, NamedTuple, Set
 from collections import defaultdict, deque
 import numpy as np
 from PIL import Image
@@ -25,12 +25,15 @@ import math
 
 # 默认参数
 DEFAULT_INPUT_DIR = r"/data/jingwei/yantingxuan/Datasets/CityCN/Final"
-DEFAULT_OUTPUT_DIR = r"/data/jingwei/yantingxuan/Datasets/CityCN/Split31"
+DEFAULT_OUTPUT_DIR = r"/data/jingwei/yantingxuan/Datasets/CityCN/Split43"
 DEFAULT_TILE_SIZE = 512
-DEFAULT_VAL_RATIO = 0.2
+DEFAULT_VAL_RATIO = 0.2 # 验证集比例
 DEFAULT_BLACK_THRESHOLD = 0.95
 DEFAULT_OVERLAP_STRATEGY = "average" # latest, average, max
 DEFAULT_TILE_OVERLAP_RATIO = 0.25  # 0 表示无重叠
+DEFAULT_LABEL_SIMILARITY_THRESHOLD = 0.98 # 标签相似度阈值
+DEFAULT_MIN_LABEL_VARIATION_RATIO = 0.05 # 标签最小变化阈值
+DEFAULT_RANDOM_SEED = 666
 
 
 @dataclass
@@ -57,6 +60,7 @@ class TileMetadata:
     foreground_ratio: Optional[float] = None
     visual_features: Optional[np.ndarray] = None
     group_id: Optional[int] = None
+    label_signature: Optional[np.ndarray] = None
 
 
 @dataclass
@@ -325,25 +329,22 @@ class MetadataProcessor:
                 global_bounds = (tile_min_x, tile_min_y, tile_max_x, tile_max_y)
                 
                 # 找到与此切片相交的所有源图像
-                source_mappings = []
+                matched_images = []
                 for img_meta in self.images_metadata:
                     # 检查地理边界是否相交
                     ib = img_meta.bounds_in_target if img_meta.bounds_in_target is not None else img_meta.bounds
                     if (ib[2] > tile_min_x and ib[0] < tile_max_x and
                         ib[3] > tile_min_y and ib[1] < tile_max_y):
-                        
-                        # 计算在源图像中的像素区域
-                        # 不在此处计算具体像素窗口，延后到 compute_src_dst_windows 中统一按CRS转换
-                        source_mappings.append((img_meta.base_name, (0, 0, 0, 0)))
-                
-                # 只保留有源图像映射的切片
-                if source_mappings:
+                        matched_images.append(img_meta)
+
+                # 为每个匹配的源图像生成独立的切片元数据（不再合并成单一大图）
+                for img_meta in matched_images:
                     tile_meta = TileMetadata(
                         row=row_idx,
                         col=col_idx,
                         global_bounds=global_bounds,
                         pixel_bounds=pixel_bounds,
-                        source_mappings=source_mappings
+                        source_mappings=[(img_meta.base_name, (0, 0, 0, 0))]
                     )
                     tiles_metadata.append(tile_meta)
         
@@ -359,34 +360,6 @@ class MetadataProcessor:
             return
 
         cell_size = max(1, min(self.tile_size, self.tile_stride))
-        cell_map: Dict[Tuple[int, int], List[int]] = defaultdict(list)
-
-        def record_cells(tile_idx: int, bounds: Tuple[int, int, int, int]):
-            x1, y1, x2, y2 = bounds
-            cell_x1 = x1 // cell_size
-            cell_y1 = y1 // cell_size
-            cell_x2 = (max(x1, x2 - 1)) // cell_size
-            cell_y2 = (max(y1, y2 - 1)) // cell_size
-            for cx in range(cell_x1, cell_x2 + 1):
-                for cy in range(cell_y1, cell_y2 + 1):
-                    cell_map[(cx, cy)].append(tile_idx)
-
-        for idx, tile in enumerate(tiles_metadata):
-            record_cells(idx, tile.pixel_bounds)
-
-        def iter_candidates(tile_idx: int) -> List[int]:
-            bounds = tiles_metadata[tile_idx].pixel_bounds
-            x1, y1, x2, y2 = bounds
-            cell_x1 = x1 // cell_size
-            cell_y1 = y1 // cell_size
-            cell_x2 = (max(x1, x2 - 1)) // cell_size
-            cell_y2 = (max(y1, y2 - 1)) // cell_size
-            candidates = set()
-            for cx in range(cell_x1, cell_x2 + 1):
-                for cy in range(cell_y1, cell_y2 + 1):
-                    candidates.update(cell_map[(cx, cy)])
-            candidates.discard(tile_idx)
-            return list(candidates)
 
         def rectangles_overlap(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) -> bool:
             ax1, ay1, ax2, ay2 = a
@@ -395,25 +368,64 @@ class MetadataProcessor:
             overlap_y = min(ay2, by2) - max(ay1, by1)
             return overlap_x > 0 and overlap_y > 0
 
-        visited = set()
         group_id = 0
+        source_to_indices: Dict[str, List[int]] = defaultdict(list)
+        for idx, tile in enumerate(tiles_metadata):
+            if tile.source_mappings:
+                source_key = tile.source_mappings[0][0]
+            else:
+                source_key = f"unknown_{idx}"
+            source_to_indices[source_key].append(idx)
 
-        for idx in range(len(tiles_metadata)):
-            if idx in visited:
+        for indices in source_to_indices.values():
+            if not indices:
                 continue
-            queue = deque([idx])
-            visited.add(idx)
-            while queue:
-                current = queue.popleft()
-                tile = tiles_metadata[current]
-                tile.group_id = group_id
-                for cand in iter_candidates(current):
-                    if cand in visited:
-                        continue
-                    if rectangles_overlap(tile.pixel_bounds, tiles_metadata[cand].pixel_bounds):
-                        visited.add(cand)
-                        queue.append(cand)
-            group_id += 1
+
+            cell_map: Dict[Tuple[int, int], List[int]] = defaultdict(list)
+
+            for idx in indices:
+                x1, y1, x2, y2 = tiles_metadata[idx].pixel_bounds
+                cell_x1 = x1 // cell_size
+                cell_y1 = y1 // cell_size
+                cell_x2 = (max(x1, x2 - 1)) // cell_size
+                cell_y2 = (max(y1, y2 - 1)) // cell_size
+                for cx in range(cell_x1, cell_x2 + 1):
+                    for cy in range(cell_y1, cell_y2 + 1):
+                        cell_map[(cx, cy)].append(idx)
+
+            visited = set()
+
+            def iter_candidates(tile_idx: int) -> List[int]:
+                bounds = tiles_metadata[tile_idx].pixel_bounds
+                x1, y1, x2, y2 = bounds
+                cell_x1 = x1 // cell_size
+                cell_y1 = y1 // cell_size
+                cell_x2 = (max(x1, x2 - 1)) // cell_size
+                cell_y2 = (max(y1, y2 - 1)) // cell_size
+                candidates = set()
+                for cx in range(cell_x1, cell_x2 + 1):
+                    for cy in range(cell_y1, cell_y2 + 1):
+                        for cand in cell_map.get((cx, cy), []):
+                            candidates.add(cand)
+                candidates.discard(tile_idx)
+                return list(candidates)
+
+            for idx in indices:
+                if idx in visited:
+                    continue
+                queue = deque([idx])
+                visited.add(idx)
+                while queue:
+                    current = queue.popleft()
+                    tile = tiles_metadata[current]
+                    tile.group_id = group_id
+                    for cand in iter_candidates(current):
+                        if cand in visited:
+                            continue
+                        if rectangles_overlap(tile.pixel_bounds, tiles_metadata[cand].pixel_bounds):
+                            visited.add(cand)
+                            queue.append(cand)
+                group_id += 1
 
         print(f"重叠分组完成: {group_id} 组")
     
@@ -480,22 +492,48 @@ class MetadataProcessor:
                 total_pixels = label_tile.size
                 fg_pixels = np.sum(label_tile > 0)
                 fg_ratio = fg_pixels / total_pixels if total_pixels > 0 else 0
-                
+
                 tile_meta.foreground_ratio = fg_ratio
-                
+                tile_meta.label_signature = self._create_label_signature(label_tile)
+
             except Exception as e:
                 print(f"警告: 计算切片 ({tile_meta.row}, {tile_meta.col}) 前景比例时出错: {e}")
                 tile_meta.foreground_ratio = 0
+                tile_meta.label_signature = None
         
         return tiles_metadata
+
+    def _create_label_signature(self, label_tile: np.ndarray) -> Optional[np.ndarray]:
+        """为标签生成压缩签名，用于相似度筛选"""
+        if label_tile is None or label_tile.size == 0:
+            return None
+        try:
+            label_bool = (label_tile > 0).astype(np.uint8)
+            target_size = 64 if self.tile_size >= 64 else self.tile_size
+            if label_bool.shape[0] != target_size:
+                img = Image.fromarray(label_bool * 255)
+                img = img.resize((target_size, target_size), Image.NEAREST)
+                signature = (np.array(img) > 0).astype(np.uint8)
+            else:
+                signature = label_bool
+            return signature
+        except Exception as e:
+            print(f"警告: 生成标签签名时出错: {e}")
+            return None
 
 
 class DatasetSplitter:
     """数据集划分器"""
     
-    def __init__(self, val_ratio: float = 0.2, black_threshold: float = 0.95):
+    def __init__(self, val_ratio: float = 0.2, black_threshold: float = 0.95,
+                 label_similarity_threshold: float = DEFAULT_LABEL_SIMILARITY_THRESHOLD,
+                 min_label_variation: float = DEFAULT_MIN_LABEL_VARIATION_RATIO,
+                 random_seed: int = DEFAULT_RANDOM_SEED):
         self.val_ratio = val_ratio
         self.black_threshold = black_threshold
+        self.label_similarity_threshold = max(0.0, min(1.0, label_similarity_threshold))
+        self.min_label_variation = max(0.0, min(1.0, min_label_variation))
+        self._rand = random.Random(random_seed)
 
     def _build_groups(self, tiles: List[TileMetadata]) -> List[TileGroup]:
         groups: Dict[int, List[TileMetadata]] = defaultdict(list)
@@ -649,7 +687,13 @@ class DatasetSplitter:
                 valid_tiles.append(tile_meta)
         
         print(f"过滤后保留 {len(valid_tiles)} 个有效切片")
-        
+        valid_tiles, removed_similar = self._filter_similar_labels(
+            valid_tiles,
+            similarity_threshold=self.label_similarity_threshold
+        )
+        if removed_similar > 0:
+            print(f"依据标签相似度过滤后保留 {len(valid_tiles)} 个切片")
+
         if not valid_tiles:
             raise ValueError("没有有效的切片")
 
@@ -724,10 +768,43 @@ class DatasetSplitter:
             else:
                 print("  视觉特征差异: 无法计算")
 
+        train_tiles, val_tiles, adjusted_group_ids, singleton_group_ids, val_count_delta = self._ensure_group_split(
+            tile_groups, train_tiles, val_tiles)
+
+        if adjusted_group_ids:
+            print(f"为 {len(adjusted_group_ids)} 个重叠组重新分配切片，使每组大约 {self.val_ratio:.2f} 比例划入验证集。")
+        else:
+            print("所有重叠组原本已按目标比例覆盖训练集和验证集。")
+
+        if singleton_group_ids:
+            print(f"注意: {len(singleton_group_ids)} 个重叠组仅包含 1 个切片，无法同时划分到训练/验证集。")
+
+        if val_count_delta != 0:
+            print(f"组覆盖调整导致验证集切片数量变化 {val_count_delta:+d}")
+
+        train_groups = self._build_groups(train_tiles)
+        val_groups = self._build_groups(val_tiles)
+
+        train_fg_ratio = self._mean_fg_ratio_from_tiles(train_tiles)
+        val_fg_ratio = self._mean_fg_ratio_from_tiles(val_tiles)
+        current_val_tiles = len(val_tiles)
+        current_val_ratio = current_val_tiles / total_tiles if total_tiles > 0 else 0.0
+        feature_gap = self._calculate_feature_gap(train_tiles, val_tiles)
+
+        print("最终划分结果:")
+        print(f"  训练集: {len(train_tiles)} 个切片 ({len(train_groups)} 组)，前景比例: {train_fg_ratio:.4f}")
+        print(f"  验证集: {len(val_tiles)} 个切片 ({len(val_groups)} 组)，前景比例: {val_fg_ratio:.4f}")
+        print(f"  前景比例差异: {abs(train_fg_ratio - val_fg_ratio):.4f}")
+        print(f"  当前验证占比: {current_val_ratio:.4f}，目标占比: {self.val_ratio:.4f}")
+        if feature_gap is not None:
+            print(f"  视觉特征差异: {feature_gap:.4f}")
+        else:
+            print("  视觉特征差异: 无法计算")
+
         # 显示详细的平衡度分析
         self._analyze_balance(train_tiles, val_tiles, global_fg_ratio)
 
-        final_val_tiles = self._count_tiles(val_groups)
+        final_val_tiles = len(val_tiles)
         final_val_ratio = final_val_tiles / total_tiles if total_tiles > 0 else 0.0
         print(f"最终验证占比: {final_val_ratio:.4f}，目标占比: {self.val_ratio:.4f}")
         deviation_tiles = abs(final_val_tiles - target_val_tiles)
@@ -736,6 +813,63 @@ class DatasetSplitter:
             print(f"提示: 受重叠组约束影响，验证集切片数相对目标存在 {deviation_tiles} 个切片的偏差。")
 
         return train_tiles, val_tiles
+
+    def _filter_similar_labels(self, tiles: List[TileMetadata], similarity_threshold: float) -> Tuple[List[TileMetadata], int]:
+        """基于标签签名去除高相似度切片"""
+        if not tiles:
+            return tiles, 0
+
+        similarity_threshold = max(0.0, min(1.0, similarity_threshold))
+        if similarity_threshold <= 0.0:
+            return tiles, 0
+
+        buckets: Dict[Tuple[int, int], List[TileMetadata]] = defaultdict(list)
+        for tile in tiles:
+            buckets[(tile.row, tile.col)].append(tile)
+
+        filtered_tiles: List[TileMetadata] = []
+        removed = 0
+
+        for bucket_tiles in buckets.values():
+            if len(bucket_tiles) <= 1:
+                filtered_tiles.extend(bucket_tiles)
+                continue
+
+            kept_tiles: List[TileMetadata] = []
+            kept_signatures: List[Tuple[Optional[np.ndarray], float]] = []
+
+            for tile in bucket_tiles:
+                signature = tile.label_signature
+                fg_ratio = tile.foreground_ratio or 0.0
+                if signature is None or fg_ratio < self.min_label_variation:
+                    kept_tiles.append(tile)
+                    kept_signatures.append((None, fg_ratio))
+                    continue
+
+                duplicate_found = False
+                for kept_sig, kept_fg in kept_signatures:
+                    if kept_sig is None or kept_fg < self.min_label_variation:
+                        continue
+                    if kept_sig.shape != signature.shape:
+                        continue
+                    similarity = np.mean(kept_sig == signature)
+                    if similarity >= similarity_threshold:
+                        duplicate_found = True
+                        break
+
+                if duplicate_found:
+                    removed += 1
+                    continue
+
+                kept_tiles.append(tile)
+                kept_signatures.append((signature, fg_ratio))
+
+            filtered_tiles.extend(kept_tiles)
+
+        if removed > 0:
+            print(f"依据标签相似度移除 {removed} 个切片（阈值 {similarity_threshold:.2f}）")
+
+        return filtered_tiles, removed
     
     def _analyze_balance(self, train_tiles: List[TileMetadata], 
                         val_tiles: List[TileMetadata], global_fg_ratio: float):
@@ -787,7 +921,7 @@ class DatasetSplitter:
         print("=" * 30)
 
     def _kmeans_cluster(self, features: np.ndarray, n_clusters: int, max_iter: int = 20) -> np.ndarray:
-        rng = np.random.default_rng(20240118)
+        rng = np.random.default_rng(DEFAULT_RANDOM_SEED)
         if n_clusters <= 1 or features.shape[0] <= 1:
             return np.zeros(features.shape[0], dtype=np.int32)
         n_clusters = min(n_clusters, features.shape[0])
@@ -836,7 +970,7 @@ class DatasetSplitter:
             indices = np.where(labels == label)[0]
             cluster_tiles = [tiles[idx] for idx in indices]
             if cluster_tiles:
-                random.shuffle(cluster_tiles)
+                self._rand.shuffle(cluster_tiles)
                 strata.append(cluster_tiles)
         if len(strata) < 2:
             return None
@@ -862,6 +996,166 @@ class DatasetSplitter:
         if train_features is None or val_features is None:
             return None
         return float(np.linalg.norm(train_features.mean(axis=0) - val_features.mean(axis=0)))
+
+    def _ensure_group_split(self,
+                            tile_groups: List[TileGroup],
+                            train_tiles: List[TileMetadata],
+                            val_tiles: List[TileMetadata]
+                            ) -> Tuple[List[TileMetadata], List[TileMetadata], Set[int], Set[int], int]:
+        """调整切片分配，力求每个重叠组按验证占比拆分到两个集合。"""
+        if not tile_groups:
+            return train_tiles, val_tiles, set(), set(), 0
+
+        train_list = list(train_tiles)
+        val_list = list(val_tiles)
+        train_ids = {id(tile) for tile in train_list}
+        val_ids = {id(tile) for tile in val_list}
+        tile_to_group: Dict[int, int] = {}
+        for group in tile_groups:
+            for tile in group.tiles:
+                tile_to_group[id(tile)] = group.group_id
+        group_lookup = {group.group_id: group for group in tile_groups}
+
+        original_val_count = len(val_list)
+        adjusted_groups: Set[int] = set()
+        singleton_groups: Set[int] = set()
+
+        def remove_from_list(lst: List[TileMetadata], id_set: Set[int], tile: TileMetadata) -> bool:
+            tile_id = id(tile)
+            if tile_id not in id_set:
+                return False
+            for idx, existing in enumerate(lst):
+                if existing is tile:
+                    lst.pop(idx)
+                    id_set.remove(tile_id)
+                    return True
+            return False
+
+        def add_to_list(lst: List[TileMetadata], id_set: Set[int], tile: TileMetadata) -> None:
+            tile_id = id(tile)
+            if tile_id in id_set:
+                return
+            lst.append(tile)
+            id_set.add(tile_id)
+
+        for group in tile_groups:
+            group_tiles = group.tiles
+            group_size = len(group_tiles)
+            if group_size <= 1:
+                singleton_groups.add(group.group_id)
+                continue
+
+            desired_val = int(round(group_size * self.val_ratio))
+            desired_val = max(1, min(group_size - 1, desired_val))
+
+            train_members = [tile for tile in group_tiles if id(tile) in train_ids]
+            val_members = [tile for tile in group_tiles if id(tile) in val_ids]
+
+            if not train_members:
+                if not val_members:
+                    continue
+                tile_to_move = self._rand.choice(val_members)
+                if remove_from_list(val_list, val_ids, tile_to_move):
+                    add_to_list(train_list, train_ids, tile_to_move)
+                    val_members.remove(tile_to_move)
+                    train_members.append(tile_to_move)
+                    adjusted_groups.add(group.group_id)
+
+            if not val_members:
+                if not train_members:
+                    continue
+                tile_to_move = self._rand.choice(train_members)
+                if remove_from_list(train_list, train_ids, tile_to_move):
+                    add_to_list(val_list, val_ids, tile_to_move)
+                    train_members.remove(tile_to_move)
+                    val_members.append(tile_to_move)
+                    adjusted_groups.add(group.group_id)
+
+            while len(val_members) < desired_val and len(train_members) > 1:
+                tile_to_move = self._rand.choice(train_members)
+                if remove_from_list(train_list, train_ids, tile_to_move):
+                    add_to_list(val_list, val_ids, tile_to_move)
+                    train_members.remove(tile_to_move)
+                    val_members.append(tile_to_move)
+                    adjusted_groups.add(group.group_id)
+
+            while len(val_members) > desired_val and len(val_members) > 1:
+                tile_to_move = self._rand.choice(val_members)
+                if remove_from_list(val_list, val_ids, tile_to_move):
+                    add_to_list(train_list, train_ids, tile_to_move)
+                    val_members.remove(tile_to_move)
+                    train_members.append(tile_to_move)
+                    adjusted_groups.add(group.group_id)
+
+            if len(val_members) == 0 and len(train_members) > 1:
+                tile_to_move = self._rand.choice(train_members)
+                if remove_from_list(train_list, train_ids, tile_to_move):
+                    add_to_list(val_list, val_ids, tile_to_move)
+                    adjusted_groups.add(group.group_id)
+
+        total_tiles = len(train_list) + len(val_list)
+        target_total_val = max(1, min(total_tiles - 1, int(round(total_tiles * self.val_ratio))))
+
+        group_val_counts: Dict[int, int] = {}
+        group_train_counts: Dict[int, int] = {}
+        for group in tile_groups:
+            val_count = 0
+            train_count = 0
+            for tile in group.tiles:
+                if id(tile) in val_ids:
+                    val_count += 1
+                elif id(tile) in train_ids:
+                    train_count += 1
+            group_val_counts[group.group_id] = val_count
+            group_train_counts[group.group_id] = train_count
+
+        diff = len(val_list) - target_total_val
+        if diff > 0:
+            movable_groups = [gid for gid, count in group_val_counts.items() if count > 1]
+            while diff > 0 and movable_groups:
+                gid = self._rand.choice(movable_groups)
+                group_obj = group_lookup.get(gid)
+                if not group_obj:
+                    movable_groups.remove(gid)
+                    continue
+                candidates = [tile for tile in group_obj.tiles if id(tile) in val_ids]
+                if len(candidates) <= 1:
+                    movable_groups.remove(gid)
+                    continue
+                tile_to_move = self._rand.choice(candidates)
+                if remove_from_list(val_list, val_ids, tile_to_move):
+                    add_to_list(train_list, train_ids, tile_to_move)
+                    group_val_counts[gid] -= 1
+                    group_train_counts[gid] += 1
+                    diff -= 1
+                    adjusted_groups.add(gid)
+                if group_val_counts[gid] <= 1 and gid in movable_groups:
+                    movable_groups.remove(gid)
+
+        elif diff < 0:
+            movable_groups = [gid for gid, count in group_train_counts.items() if count > 1]
+            while diff < 0 and movable_groups:
+                gid = self._rand.choice(movable_groups)
+                group_obj = group_lookup.get(gid)
+                if not group_obj:
+                    movable_groups.remove(gid)
+                    continue
+                candidates = [tile for tile in group_obj.tiles if id(tile) in train_ids]
+                if len(candidates) <= 1:
+                    movable_groups.remove(gid)
+                    continue
+                tile_to_move = self._rand.choice(candidates)
+                if remove_from_list(train_list, train_ids, tile_to_move):
+                    add_to_list(val_list, val_ids, tile_to_move)
+                    group_train_counts[gid] -= 1
+                    group_val_counts[gid] += 1
+                    diff += 1
+                    adjusted_groups.add(gid)
+                if group_train_counts[gid] <= 1 and gid in movable_groups:
+                    movable_groups.remove(gid)
+
+        final_diff = len(val_list) - original_val_count
+        return train_list, val_list, adjusted_groups, singleton_groups, final_diff
 
     def _assign_groups_by_ratio(self, tile_groups: List[TileGroup], target_val_tiles: int) -> Tuple[List[TileGroup], List[TileGroup]]:
         if len(tile_groups) < 2:
@@ -948,8 +1242,8 @@ class DatasetSplitter:
             for _ in range(40):
                 if not train_groups or not val_groups:
                     break
-                train_idx = random.randrange(len(train_groups))
-                val_idx = random.randrange(len(val_groups))
+                train_idx = self._rand.randrange(len(train_groups))
+                val_idx = self._rand.randrange(len(val_groups))
                 train_group = train_groups[train_idx]
                 val_group = val_groups[val_idx]
                 if train_group.visual_features is None or val_group.visual_features is None:
@@ -1164,8 +1458,12 @@ class TileGenerator:
             # 生成切片数据
             tile_data = self.generate_tile(tile_meta)
             
-            # 构建文件名
-            base_name = f"tile_r{tile_meta.row}_c{tile_meta.col}"
+            # 构建文件名，附加源图像标识，避免不同源图像的重复区域被覆盖
+            if tile_meta.source_mappings:
+                source_tag = tile_meta.source_mappings[0][0]
+            else:
+                source_tag = "tile"
+            base_name = f"{source_tag}_r{tile_meta.row}_c{tile_meta.col}"
             
             # 保存每种类型
             for src_type, dst_type in type_mapping.items():
@@ -1190,9 +1488,10 @@ def main():
     
     # 设置随机种子确保可重现性
     import random
-    random.seed(42)
-    np.random.seed(42)
-    
+    random_seed = DEFAULT_RANDOM_SEED
+    random.seed(random_seed)
+    np.random.seed(random_seed)
+
     # 使用默认参数
     input_dir = DEFAULT_INPUT_DIR
     output_dir = DEFAULT_OUTPUT_DIR
@@ -1200,6 +1499,8 @@ def main():
     val_ratio = DEFAULT_VAL_RATIO
     black_threshold = DEFAULT_BLACK_THRESHOLD
     overlap_ratio = DEFAULT_TILE_OVERLAP_RATIO
+    label_similarity_threshold = DEFAULT_LABEL_SIMILARITY_THRESHOLD
+    min_label_variation = DEFAULT_MIN_LABEL_VARIATION_RATIO
     
     print(f"输入目录: {input_dir}")
     print(f"输出目录: {output_dir}")
@@ -1207,7 +1508,9 @@ def main():
     print(f"验证集比例: {val_ratio}")
     print(f"切片重叠比例: {overlap_ratio:.2f}")
     print(f"重叠处理策略: {DEFAULT_OVERLAP_STRATEGY}")
-    print(f"随机种子: 42 (确保结果可重现)")
+    print(f"标签相似度阈值: {label_similarity_threshold:.2f}")
+    print(f"标签最小变化阈值: {min_label_variation:.4f}")
+    print(f"随机种子: {random_seed} (确保结果可重现)")
     
     os.makedirs(output_dir, exist_ok=True)
     
@@ -1224,7 +1527,7 @@ def main():
         tiles_metadata = processor.calculate_foreground_ratios(tiles_metadata)
         
         # 第四步：划分数据集
-        splitter = DatasetSplitter(val_ratio, black_threshold)
+        splitter = DatasetSplitter(val_ratio, black_threshold, label_similarity_threshold, min_label_variation, random_seed)
         train_tiles, val_tiles = splitter.split_tiles(processor, tiles_metadata)
         
         # 第五步：生成并保存实际图像

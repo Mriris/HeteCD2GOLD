@@ -11,8 +11,8 @@
 import os
 import glob
 import random
-import gc
-from typing import Dict, List, Tuple, Optional, NamedTuple, Set
+import shutil
+from typing import Dict, List, Tuple, Optional, Set
 from collections import defaultdict, deque
 import numpy as np
 from PIL import Image
@@ -29,7 +29,6 @@ DEFAULT_OUTPUT_DIR = r"/data/jingwei/yantingxuan/Datasets/CityCN/Split43"
 DEFAULT_TILE_SIZE = 512
 DEFAULT_VAL_RATIO = 0.2 # 验证集比例
 DEFAULT_BLACK_THRESHOLD = 0.95
-DEFAULT_OVERLAP_STRATEGY = "average" # latest, average, max
 DEFAULT_TILE_OVERLAP_RATIO = 0.25  # 0 表示无重叠
 DEFAULT_LABEL_SIMILARITY_THRESHOLD = 0.98 # 标签相似度阈值
 DEFAULT_MIN_LABEL_VARIATION_RATIO = 0.05 # 标签最小变化阈值
@@ -56,7 +55,7 @@ class TileMetadata:
     col: int
     global_bounds: Tuple[float, float, float, float]  # 全局坐标
     pixel_bounds: Tuple[int, int, int, int]  # 在合并图像中的像素坐标
-    source_mappings: List[Tuple[str, Tuple[int, int, int, int]]]  # (base_name, 在源图像中的像素区域)
+    source_mappings: List[str]  # 来源图像标识
     foreground_ratio: Optional[float] = None
     visual_features: Optional[np.ndarray] = None
     group_id: Optional[int] = None
@@ -79,13 +78,12 @@ class TileGroup:
 class MetadataProcessor:
     """元数据处理器"""
     
-    def __init__(self, input_dir: str, tile_size: int = 512, 
-                 black_threshold: float = 0.95, overlap_strategy: str = "latest",
+    def __init__(self, input_dir: str, tile_size: int = 512,
+                 black_threshold: float = 0.95,
                  overlap_ratio: float = DEFAULT_TILE_OVERLAP_RATIO):
         self.input_dir = input_dir
         self.tile_size = tile_size
         self.black_threshold = black_threshold
-        self.overlap_strategy = overlap_strategy
         self.overlap_ratio = max(0.0, min(overlap_ratio, 0.95))
         overlap_pixels = int(round(self.tile_size * self.overlap_ratio))
         self.overlap_pixels = max(0, min(self.tile_size - 1, overlap_pixels))
@@ -344,7 +342,7 @@ class MetadataProcessor:
                         col=col_idx,
                         global_bounds=global_bounds,
                         pixel_bounds=pixel_bounds,
-                        source_mappings=[(img_meta.base_name, (0, 0, 0, 0))]
+                        source_mappings=[img_meta.base_name]
                     )
                     tiles_metadata.append(tile_meta)
         
@@ -372,7 +370,7 @@ class MetadataProcessor:
         source_to_indices: Dict[str, List[int]] = defaultdict(list)
         for idx, tile in enumerate(tiles_metadata):
             if tile.source_mappings:
-                source_key = tile.source_mappings[0][0]
+                source_key = tile.source_mappings[0]
             else:
                 source_key = f"unknown_{idx}"
             source_to_indices[source_key].append(idx)
@@ -439,7 +437,7 @@ class MetadataProcessor:
                 label_tile = np.zeros((self.tile_size, self.tile_size), dtype=np.uint8)
                 
                 # 合并所有源图像的标签
-                for base_name, _ in tile_meta.source_mappings:
+                for base_name in tile_meta.source_mappings:
                     # 找到对应的图像元数据
                     img_meta = next(m for m in self.images_metadata if m.base_name == base_name)
                     
@@ -604,7 +602,7 @@ class DatasetSplitter:
             # 创建A通道的合并tile用于黑块检测
             a_tile = np.zeros((processor.tile_size, processor.tile_size, 3), dtype=np.uint8)
             
-            for base_name, _ in tile_meta.source_mappings:
+            for base_name in tile_meta.source_mappings:
                 img_meta = next(m for m in processor.images_metadata if m.base_name == base_name)
                 windows = processor.compute_src_dst_windows(tile_meta, img_meta)
                 if windows is None:
@@ -920,62 +918,6 @@ class DatasetSplitter:
         print(f"\n平衡度评分: {balance_score}")
         print("=" * 30)
 
-    def _kmeans_cluster(self, features: np.ndarray, n_clusters: int, max_iter: int = 20) -> np.ndarray:
-        rng = np.random.default_rng(DEFAULT_RANDOM_SEED)
-        if n_clusters <= 1 or features.shape[0] <= 1:
-            return np.zeros(features.shape[0], dtype=np.int32)
-        n_clusters = min(n_clusters, features.shape[0])
-        centroids = features[rng.choice(features.shape[0], size=n_clusters, replace=False)].copy()
-        labels = np.zeros(features.shape[0], dtype=np.int32)
-        for _ in range(max_iter):
-            distances = np.linalg.norm(features[:, None, :] - centroids[None, :, :], axis=2)
-            new_labels = distances.argmin(axis=1)
-            if np.array_equal(new_labels, labels):
-                break
-            labels = new_labels
-            for idx in range(n_clusters):
-                members = features[labels == idx]
-                if members.size == 0:
-                    centroids[idx] = features[rng.integers(0, features.shape[0])]
-                else:
-                    centroids[idx] = members.mean(axis=0)
-        return labels
-
-    def _build_similarity_strata(self, tiles: List[TileMetadata]) -> Optional[List[List[TileMetadata]]]:
-        if len(tiles) < 2:
-            return None
-        feature_list = []
-        for tile in tiles:
-            if tile.visual_features is None:
-                return None
-            feature_list.append(tile.visual_features)
-        features = np.vstack(feature_list)
-        if features.size == 0:
-            return None
-        mean = features.mean(axis=0)
-        std = features.std(axis=0)
-        std[std < 1e-6] = 1.0
-        normalized = (features - mean) / std
-        approx_cluster_size = max(40, int(tiles[0].visual_features.size) * 4)
-        n_clusters = max(2, min(12, len(tiles) // approx_cluster_size))
-        if n_clusters <= 1:
-            n_clusters = 2 if len(tiles) >= 2 else 1
-        n_clusters = min(n_clusters, len(tiles))
-        labels = self._kmeans_cluster(normalized, n_clusters)
-        unique_labels = np.unique(labels)
-        if unique_labels.size < 2:
-            return None
-        strata = []
-        for label in unique_labels:
-            indices = np.where(labels == label)[0]
-            cluster_tiles = [tiles[idx] for idx in indices]
-            if cluster_tiles:
-                self._rand.shuffle(cluster_tiles)
-                strata.append(cluster_tiles)
-        if len(strata) < 2:
-            return None
-        return strata
-
     def _collect_feature_matrix(self, items) -> Optional[np.ndarray]:
         if not items:
             return None
@@ -1010,10 +952,6 @@ class DatasetSplitter:
         val_list = list(val_tiles)
         train_ids = {id(tile) for tile in train_list}
         val_ids = {id(tile) for tile in val_list}
-        tile_to_group: Dict[int, int] = {}
-        for group in tile_groups:
-            for tile in group.tiles:
-                tile_to_group[id(tile)] = group.group_id
         group_lookup = {group.group_id: group for group in tile_groups}
 
         original_val_count = len(val_list)
@@ -1353,7 +1291,7 @@ class TileGenerator:
                 tile_data[img_type] = np.zeros((self.processor.tile_size, self.processor.tile_size, 3), dtype=np.uint8)
         
         # 合并所有源图像
-        for base_name, _ in tile_meta.source_mappings:
+        for base_name in tile_meta.source_mappings:
             img_meta = next(m for m in self.processor.images_metadata if m.base_name == base_name)
             windows = self.processor.compute_src_dst_windows(tile_meta, img_meta)
             if windows is None:
@@ -1444,23 +1382,23 @@ class TileGenerator:
         
         # 保存验证集
         self._save_split(val_tiles, output_dir, 'val')
-        
-        # 复制验证集为测试集
-        self._save_split(val_tiles, output_dir, 'test')
+
+        # 复制验证集为测试集，避免重复生成切片
+        self._copy_split(output_dir, 'val', 'test')
         
         print("数据集保存完成!")
     
     def _save_split(self, tiles: List[TileMetadata], output_dir: str, split: str):
         """保存一个数据集分割"""
         type_mapping = {'A': 'A', 'B': 'B', 'D': 'C', 'label': 'label'}
-        
+
         for tile_meta in tqdm(tiles, desc=f"保存{split}集"):
             # 生成切片数据
             tile_data = self.generate_tile(tile_meta)
             
             # 构建文件名，附加源图像标识，避免不同源图像的重复区域被覆盖
             if tile_meta.source_mappings:
-                source_tag = tile_meta.source_mappings[0][0]
+                source_tag = tile_meta.source_mappings[0]
             else:
                 source_tag = "tile"
             base_name = f"{source_tag}_r{tile_meta.row}_c{tile_meta.col}"
@@ -1480,6 +1418,20 @@ class TileGenerator:
                 img = Image.fromarray(data)
                 save_path = os.path.join(output_dir, split, dst_type, f"{base_name}.png")
                 img.save(save_path)
+
+    def _copy_split(self, output_dir: str, src_split: str, dst_split: str):
+        """将已生成的切片从一个划分复制到另一个划分"""
+        for img_type in ['A', 'B', 'C', 'label']:
+            src_dir = os.path.join(output_dir, src_split, img_type)
+            dst_dir = os.path.join(output_dir, dst_split, img_type)
+            os.makedirs(dst_dir, exist_ok=True)
+
+            for file_name in os.listdir(src_dir):
+                src_path = os.path.join(src_dir, file_name)
+                dst_path = os.path.join(dst_dir, file_name)
+
+                if os.path.isfile(src_path):
+                    shutil.copy2(src_path, dst_path)
 
 
 def main():
@@ -1507,7 +1459,6 @@ def main():
     print(f"切片大小: {tile_size}x{tile_size}")
     print(f"验证集比例: {val_ratio}")
     print(f"切片重叠比例: {overlap_ratio:.2f}")
-    print(f"重叠处理策略: {DEFAULT_OVERLAP_STRATEGY}")
     print(f"标签相似度阈值: {label_similarity_threshold:.2f}")
     print(f"标签最小变化阈值: {min_label_variation:.4f}")
     print(f"随机种子: {random_seed} (确保结果可重现)")

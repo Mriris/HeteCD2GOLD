@@ -145,6 +145,88 @@ class FeatureConsistencyLoss(nn.Module):
 
     
 
+class MaskedFeatureMSELoss(nn.Module):
+    """掩码加权的特征级 MSE 蒸馏。
+
+    设计目标：在变化检测场景中，聚焦变化区域（正样本）进行更强监督，
+    对非变化区域（负样本）给较小权重，缓解类别不均衡。
+
+    输入约定：
+    - student_features: [[f_c3_pre, f_c4_pre], [f_c3_post, f_c4_post]]
+    - teacher_features: [[f_c3_pre, f_c4_pre], [f_c3_post, f_c4_post]]
+      其中两个列表分别对应同一网络分支的两模态特征；索引 0/1 对应两个尺度（例如 c3/c4）。
+    - change_mask: (N, H, W) 的 0/1 掩码（1 为变化像素）。
+
+    融合方式：对每个尺度，先对两模态特征做逐通道相加作为融合表示，再与教师对应尺度融合表示进行逐像素 MSE，
+    用上采样到该尺度的 change_mask 做加权平均。
+    """
+    def __init__(self, normalize_features: bool = True, eps: float = 1e-6):
+        super(MaskedFeatureMSELoss, self).__init__()
+        self.normalize_features = normalize_features
+        self.eps = eps
+
+    def _fuse_pair(self, feat_a: torch.Tensor, feat_b: torch.Tensor) -> torch.Tensor:
+        # 形状对齐（空间维度）
+        if feat_a.size(-2) != feat_b.size(-2) or feat_a.size(-1) != feat_b.size(-1):
+            dsize = (max(feat_a.size(-2), feat_b.size(-2)), max(feat_a.size(-1), feat_b.size(-1)))
+            feat_b = F.interpolate(feat_b, dsize, mode='bilinear', align_corners=False)
+        # 通道应一致（当前骨干设置下一致），若不一致则截断到最小通道数
+        if feat_a.size(1) != feat_b.size(1):
+            min_c = min(feat_a.size(1), feat_b.size(1))
+            feat_a = feat_a[:, :min_c]
+            feat_b = feat_b[:, :min_c]
+        fused = feat_a + feat_b
+        if self.normalize_features:
+            fused = F.layer_norm(fused, fused.shape[1:])
+        return fused
+
+    def forward(
+        self,
+        student_features: list,
+        teacher_features: list,
+        change_mask: torch.Tensor,
+        pos_weight: float = 3.0,
+        neg_weight: float = 1.0,
+    ) -> torch.Tensor:
+        assert isinstance(student_features, (list, tuple)) and isinstance(teacher_features, (list, tuple))
+        assert len(student_features) == 2 and len(teacher_features) == 2, "期望形如[[f_c3, f_c4], [f_c3, f_c4]]"
+
+        total_loss = change_mask.new_tensor(0.0)
+        scale_count = 0
+
+        for i in range(len(student_features[0])):
+            s_pre = student_features[0][i]
+            s_post = student_features[1][i]
+            t_pre = teacher_features[0][i]
+            t_post = teacher_features[1][i]
+
+            # 生成学生/教师融合特征
+            s_fused = self._fuse_pair(s_pre, s_post)
+            t_fused = self._fuse_pair(t_pre, t_post)
+
+            # 空间维对齐
+            if s_fused.size(-2) != t_fused.size(-2) or s_fused.size(-1) != t_fused.size(-1):
+                dsize = (max(s_fused.size(-2), t_fused.size(-2)), max(s_fused.size(-1), t_fused.size(-1)))
+                t_fused = F.interpolate(t_fused, dsize, mode='bilinear', align_corners=False)
+                s_fused = F.interpolate(s_fused, dsize, mode='bilinear', align_corners=False)
+
+            # 掩码上采样到该尺度
+            n, c, h, w = s_fused.size()
+            mask = F.interpolate(change_mask.float().unsqueeze(1), size=(h, w), mode='nearest').squeeze(1)
+            weights = pos_weight * mask + neg_weight * (1.0 - mask)
+
+            # 逐像素 MSE 并加权
+            diff2 = (s_fused - t_fused) ** 2  # (n, c, h, w)
+            diff2 = diff2.sum(dim=1)  # (n, h, w)
+            weighted_sum = (diff2 * weights).sum()
+            denom = weights.sum() * c + self.eps
+            loss_i = weighted_sum / denom
+
+            total_loss = total_loss + loss_i
+            scale_count += 1
+
+        return total_loss / max(scale_count, 1)
+
 def Dice_loss(inputs, target, beta=1, smooth = 1e-5):
     target = F.one_hot(target, num_classes=2)
     n, c, h, w = inputs.size()

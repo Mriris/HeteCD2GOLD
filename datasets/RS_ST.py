@@ -32,14 +32,10 @@ class CDDataAugmentation:
             with_random_hflip=False,
             with_random_vflip=False,
             with_random_rot=False,
-            rot_degree=20,
-            rot_prob=0.5,
             with_random_crop=False,
             with_scale_random_crop=False,
             with_random_blur=False,
-            random_color_tf=False,
-            cat_max_ratio=0.75,
-            cat_max_ratio_tries=10
+            random_color_tf=False
     ):
         self.img_size = img_size
         if self.img_size is None:
@@ -49,14 +45,10 @@ class CDDataAugmentation:
         self.with_random_hflip = with_random_hflip
         self.with_random_vflip = with_random_vflip
         self.with_random_rot = with_random_rot
-        self.rot_degree = rot_degree
-        self.rot_prob = rot_prob
         self.with_random_crop = with_random_crop
         self.with_scale_random_crop = with_scale_random_crop
         self.with_random_blur = with_random_blur
         self.random_color_tf=random_color_tf
-        self.cat_max_ratio = cat_max_ratio
-        self.cat_max_ratio_tries = cat_max_ratio_tries
     def transform(self, imgs, labels, to_tensor=True):
         """
         :param imgs: [ndarray,]
@@ -90,41 +82,16 @@ class CDDataAugmentation:
             imgs = [F.vflip(img) for img in imgs]
             labels = [F.vflip(img) for img in labels]
 
-        if self.with_random_rot and random.random() < self.rot_prob:
-            # 小角度随机旋转，图像用双线性，标签用最近邻
-            angle = random.uniform(-self.rot_degree, self.rot_degree)
-            imgs = [img.rotate(angle, resample=Image.BILINEAR) for img in imgs]
-            labels = [img.rotate(angle, resample=Image.NEAREST) for img in labels]
+        if self.with_random_rot and random.random() > random_base:
+            angles = [90, 180, 270]
+            index = random.randint(0, 2)
+            angle = angles[index]
+            imgs = [F.rotate(img, angle) for img in imgs]
+            labels = [F.rotate(img, angle) for img in labels]
 
         if self.with_random_crop and random.random() > 0:
-            # 多次尝试，避免裁剪块被单一类别主导
-            tried = 0
-            chosen = None
-            while tried < self.cat_max_ratio_tries:
-                i, j, h, w = transforms.RandomResizedCrop(size=self.img_size). \
-                    get_params(img=imgs[0], scale=(0.8, 1.2), ratio=(1, 1))
-                # 先对标签进行试裁剪并计算类别占比
-                trial_label = F.resized_crop(labels[0], i, j, h, w,
-                                             size=(self.img_size, self.img_size),
-                                             interpolation=Image.NEAREST)
-                trial_np = np.array(trial_label, dtype=np.uint8)
-                valid_mask = (trial_np != 255)
-                valid_cnt = int(valid_mask.sum())
-                if valid_cnt == 0:
-                    chosen = (i, j, h, w)
-                    break
-                cnt0 = int((trial_np[valid_mask] == 0).sum())
-                cnt1 = int((trial_np[valid_mask] == 1).sum())
-                max_ratio = max(cnt0, cnt1) / float(valid_cnt)
-                if max_ratio <= self.cat_max_ratio:
-                    chosen = (i, j, h, w)
-                    break
-                tried += 1
-            if chosen is None:
-                i, j, h, w = transforms.RandomResizedCrop(size=self.img_size). \
-                    get_params(img=imgs[0], scale=(0.8, 1.2), ratio=(1, 1))
-            else:
-                i, j, h, w = chosen
+            i, j, h, w = transforms.RandomResizedCrop(size=self.img_size). \
+                get_params(img=imgs[0], scale=(0.8, 1.2), ratio=(1, 1))
 
             imgs = [F.resized_crop(img, i, j, h, w,
                                     size=(self.img_size, self.img_size),
@@ -143,31 +110,12 @@ class CDDataAugmentation:
 
             imgs = [pil_rescale(img, target_scale, order=3) for img in imgs]
             labels = [pil_rescale(img, target_scale, order=0) for img in labels]
-            # crop with category max ratio constraint
+            # crop
             imgsize = imgs[0].size  # h, w
-            tried = 0
-            chosen_box = None
-            while tried < self.cat_max_ratio_tries:
-                box = get_random_crop_box(imgsize=imgsize, cropsize=self.img_size)
-                trial_label = pil_crop(labels[0], box, cropsize=self.img_size, default_value=255)
-                trial_np = np.array(trial_label, dtype=np.uint8)
-                valid_mask = (trial_np != 255)
-                valid_cnt = int(valid_mask.sum())
-                if valid_cnt == 0:
-                    chosen_box = box
-                    break
-                cnt0 = int((trial_np[valid_mask] == 0).sum())
-                cnt1 = int((trial_np[valid_mask] == 1).sum())
-                max_ratio = max(cnt0, cnt1) / float(valid_cnt)
-                if max_ratio <= self.cat_max_ratio:
-                    chosen_box = box
-                    break
-                tried += 1
-            if chosen_box is None:
-                chosen_box = get_random_crop_box(imgsize=imgsize, cropsize=self.img_size)
-            imgs = [pil_crop(img, chosen_box, cropsize=self.img_size, default_value=0)
+            box = get_random_crop_box(imgsize=imgsize, cropsize=self.img_size)
+            imgs = [pil_crop(img, box, cropsize=self.img_size, default_value=0)
                     for img in imgs]
-            labels = [pil_crop(img, chosen_box, cropsize=self.img_size, default_value=255)
+            labels = [pil_crop(img, box, cropsize=self.img_size, default_value=255)
                     for img in labels]
 
         if self.with_random_blur and random.random() > 0:
@@ -315,14 +263,9 @@ class Data(data.Dataset):
                     img_size=512,
                     with_random_hflip=True,
                     with_random_vflip=True,
-                    with_random_rot=True,
-                    rot_degree=20,
-                    rot_prob=0.5,
                     with_scale_random_crop=True,
                     with_random_blur=True,
-                    random_color_tf=True,
-                    cat_max_ratio=0.75,
-                    cat_max_ratio_tries=10
+                    random_color_tf=True
                 )
     def get_mask_name(self, idx):
         mask_name = os.path.split(self.imgs_list_A[idx])[-1]

@@ -14,9 +14,15 @@ working_path = os.path.dirname(os.path.abspath(__file__))
 from utils.utils_fit import train
 from utils.loss import CrossEntropyLoss2d, weighted_BCE_logits, ChangeSimilarity,SCA_Loss,FeatureConsistencyLoss
 from utils.utils import accuracy, SCDD_eval_all, AverageMeter, get_confuse_matrix, cm2score
-os.environ['CUDA_VISIBLE_DEVICES'] = '3'
+os.environ['CUDA_VISIBLE_DEVICES'] = '1'
 #Data and model choose
 torch.set_num_threads(4)
+
+# 性能加速：TF32 与禁用 Inductor autotune（减少编译与运行开销）
+os.environ.setdefault('TORCHINDUCTOR_MAX_AUTOTUNE', '0')
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.set_float32_matmul_precision('high')
 
 ###############################################
 from datasets import RS_ST as RS
@@ -35,7 +41,7 @@ def setup_seed(seed):
 # # 设置随机数种子
 setup_seed(seed)
 # from models.SSCDl import SSCDl as Net
-NET_NAME = 'gold'
+NET_NAME = 'Tgold'
 DATA_NAME = 'trios43'
 EXP_NAME = "EXP"+time.strftime('%Y%m%d%H%M%S',time.localtime(time.time()))+"MSE"
 ###############################################    
@@ -85,6 +91,7 @@ def main():
         print(f"缓存内存: {torch.cuda.memory_reserved(device) / (1024**3):.2f} GB")
     
     net = Net(3).cuda()
+    # 保持输入为 channels_last，模型不整体转换，避免 rank 不一致错误
     net = nn.DataParallel(net)
     model_dict      = net.state_dict()
     pretrained_dict = torch.load("backbone_weights.pth")
@@ -118,17 +125,69 @@ def main():
     print(f"已分配内存: {torch.cuda.memory_allocated(device) / (1024**3):.2f} GB")
     print(f"缓存内存: {torch.cuda.memory_reserved(device) / (1024**3):.2f} GB")
     print(f"可用内存: {(torch.cuda.get_device_properties(device).total_memory - torch.cuda.memory_reserved(device)) / (1024**3):.2f} GB")
+    # 在加载权重后启用编译以降低 Python/框架开销
+    try:
+        net.module = torch.compile(net.module, mode='reduce-overhead')
+        print("已启用 torch.compile(mode='reduce-overhead')")
+    except Exception as e:
+        print(f"torch.compile 跳过：{e}")
         
     train_set_change = RS.Data('train', random_flip=True)
-    train_loader_change = DataLoader(train_set_change, batch_size=args['train_batch_size'], num_workers=4, shuffle=True)
+    train_loader_change = DataLoader(
+        train_set_change,
+        batch_size=args['train_batch_size'],
+        num_workers=4,
+        shuffle=True,
+        pin_memory=True,
+        pin_memory_device='cuda',
+        persistent_workers=True,
+        prefetch_factor=2,
+        drop_last=True,
+    )
     train_set_unchange = RS.Data('train', random_flip=True)
-    train_loader_unchange = DataLoader(train_set_unchange, batch_size=args['train_batch_size'], num_workers=4, shuffle=True)
+    train_loader_unchange = DataLoader(
+        train_set_unchange,
+        batch_size=args['train_batch_size'],
+        num_workers=4,
+        shuffle=True,
+        pin_memory=True,
+        pin_memory_device='cuda',
+        persistent_workers=True,
+        prefetch_factor=2,
+        drop_last=True,
+    )
     val_set = RS.Data('val')
-    val_loader = DataLoader(val_set, batch_size=args['val_batch_size'], num_workers=4, shuffle=False)
+    val_loader = DataLoader(
+        val_set,
+        batch_size=args['val_batch_size'],
+        num_workers=4,
+        shuffle=False,
+        pin_memory=True,
+        pin_memory_device='cuda',
+        persistent_workers=True,
+        prefetch_factor=2,
+        drop_last=False,
+    )
     
     criterion = CrossEntropyLoss2d(ignore_index=0).cuda()
-    optimizer = optim.AdamW(filter(lambda p: p.requires_grad, net.parameters()), lr=args['lr'], betas=(0.9, 0.999),weight_decay=0.01, )
-    scheduler = optim.lr_scheduler.StepLR(optimizer, 1, gamma=0.95, last_epoch=-1)
+    try:
+        optimizer = optim.AdamW(filter(lambda p: p.requires_grad, net.parameters()), lr=args['lr'], betas=(0.9, 0.999), weight_decay=0.01, fused=True)
+    except TypeError:
+        optimizer = optim.AdamW(filter(lambda p: p.requires_grad, net.parameters()), lr=args['lr'], betas=(0.9, 0.999), weight_decay=0.01)
+    # 使用 OneCycleLR 提速早期收敛
+    steps_per_epoch = max(1, len(train_loader_change))
+    scheduler = optim.lr_scheduler.OneCycleLR(
+        optimizer,
+        max_lr=args['lr'],
+        epochs=args['epochs'],
+        steps_per_epoch=steps_per_epoch,
+        pct_start=0.1,
+        anneal_strategy='cos',
+        div_factor=25.0,
+        final_div_factor=1e4,
+        three_phase=False,
+    )
+    args['use_onecycle'] = True
 
     train(train_loader_change, train_loader_unchange,net, criterion, optimizer, scheduler, val_loader, args)
     print('Training finished.')

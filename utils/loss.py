@@ -254,6 +254,9 @@ def CE_Loss(inputs, target,cls_weights):
     temp_inputs = inputs.transpose(1, 2).transpose(2, 3).contiguous().view(-1, c)
     temp_target = target.view(-1)
 
+    # AMP 下对齐权重 dtype/device，避免 BF16/FP16 类型不匹配
+    if cls_weights is not None:
+        cls_weights = cls_weights.to(dtype=temp_inputs.dtype, device=temp_inputs.device)
     CE_loss  = nn.CrossEntropyLoss(weight=cls_weights)(temp_inputs, temp_target)
     return CE_loss
 

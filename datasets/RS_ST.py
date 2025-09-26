@@ -48,7 +48,7 @@ class CDDataAugmentation:
         self.with_random_crop = with_random_crop
         self.with_scale_random_crop = with_scale_random_crop
         self.with_random_blur = with_random_blur
-        self.random_color_tf=random_color_tf
+        self.random_color_tf = random_color_tf
     def transform(self, imgs, labels, to_tensor=True):
         """
         :param imgs: [ndarray,]
@@ -89,9 +89,9 @@ class CDDataAugmentation:
             imgs = [F.rotate(img, angle) for img in imgs]
             labels = [F.rotate(img, angle) for img in labels]
 
-        if self.with_random_crop and random.random() > 0:
+        if self.with_random_crop and random.random() > 0.5:
             i, j, h, w = transforms.RandomResizedCrop(size=self.img_size). \
-                get_params(img=imgs[0], scale=(0.8, 1.2), ratio=(1, 1))
+                get_params(img=imgs[0], scale=(0.8, 1.0), ratio=(1, 1))
 
             imgs = [F.resized_crop(img, i, j, h, w,
                                     size=(self.img_size, self.img_size),
@@ -103,7 +103,7 @@ class CDDataAugmentation:
                                       interpolation=Image.NEAREST)
                       for img in labels]
 
-        if self.with_scale_random_crop:
+        if self.with_scale_random_crop and random.random() > 0.5:
             # rescale
             scale_range = [1, 1.2]
             target_scale = scale_range[0] + random.random() * (scale_range[1] - scale_range[0])
@@ -111,28 +111,33 @@ class CDDataAugmentation:
             imgs = [pil_rescale(img, target_scale, order=3) for img in imgs]
             labels = [pil_rescale(img, target_scale, order=0) for img in labels]
             # crop
-            imgsize = imgs[0].size  # h, w
+            # 统一使用PIL的 (width, height) 约定
+            imgsize = imgs[0].size  # (w, h)
             box = get_random_crop_box(imgsize=imgsize, cropsize=self.img_size)
             imgs = [pil_crop(img, box, cropsize=self.img_size, default_value=0)
                     for img in imgs]
             labels = [pil_crop(img, box, cropsize=self.img_size, default_value=255)
                     for img in labels]
 
-        if self.with_random_blur and random.random() > 0:
+        if self.with_random_blur and random.random() > 0.5:
             radius = random.random()
             imgs = [img.filter(ImageFilter.GaussianBlur(radius=radius))
                     for img in imgs]
 
-        if self.random_color_tf:
+        if self.random_color_tf and random.random() > 0.5:
             color_jitter = transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.3)
+            # 仅对 A/C 执行颜色扰动，跳过 B（SAR）
             imgs_tf = []
-            for img in imgs:
-                tf = transforms.ColorJitter(
-                            color_jitter.brightness, 
-                            color_jitter.contrast, 
-                            color_jitter.saturation,
-                            color_jitter.hue)
-                imgs_tf.append(tf(img))
+            for idx, img in enumerate(imgs):
+                if idx in (0, 2):  # A 和 C
+                    tf = transforms.ColorJitter(
+                                color_jitter.brightness, 
+                                color_jitter.contrast, 
+                                color_jitter.saturation,
+                                color_jitter.hue)
+                    imgs_tf.append(tf(img))
+                else:
+                    imgs_tf.append(img)
             imgs = imgs_tf
             
         # if to_tensor:
@@ -162,7 +167,7 @@ def pil_crop(image, box, cropsize, default_value):
 
 
 def get_random_crop_box(imgsize, cropsize):
-    h, w = imgsize
+    w, h = imgsize
     ch = min(cropsize, h)
     cw = min(cropsize, w)
 
@@ -188,20 +193,20 @@ def get_random_crop_box(imgsize, cropsize):
 
 def pil_rescale(img, scale, order):
     assert isinstance(img, Image.Image)
-    height, width = img.size
-    target_size = (int(np.round(height*scale)), int(np.round(width*scale)))
+    width, height = img.size
+    target_size = (int(np.round(width*scale)), int(np.round(height*scale)))
     return pil_resize(img, target_size, order)
 
 
 def pil_resize(img, size, order):
     assert isinstance(img, Image.Image)
-    if size[0] == img.size[0] and size[1] == img.size[1]:
+    if size == img.size:
         return img
     if order == 3:
         resample = Image.BICUBIC
     elif order == 0:
         resample = Image.NEAREST
-    return img.resize(size[::-1], resample)
+    return img.resize(size, resample)
 
 def showIMG(img):
     plt.imshow(img)

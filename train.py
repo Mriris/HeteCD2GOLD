@@ -65,7 +65,8 @@ args = {
     'pred_dir': os.path.join(working_path, 'checkpoints',  NET_NAME,DATA_NAME,EXP_NAME,"vis"),
     'chkpt_dir': os.path.join(working_path, 'checkpoints', NET_NAME, DATA_NAME,EXP_NAME),
     'log_dir': os.path.join(working_path, 'checkpoints', NET_NAME,DATA_NAME, EXP_NAME),
-    'load_path': os.path.join(working_path, 'checkpoints', DATA_NAME, 'pretrained.pth')
+    'load_path': os.path.join(working_path, 'checkpoints', DATA_NAME, 'pretrained.pth'),
+    'use_multi_img_photometric': True,
 }
 ###############################################
 
@@ -138,7 +139,7 @@ def main():
     except Exception as e:
         print(f"torch.compile 跳过：{e}")
         
-    train_set_change = RS.Data('train', random_flip=True)
+    train_set_change = RS.Data('train', random_flip=True, use_multi_img_photometric=args['use_multi_img_photometric'])
     train_loader_change = DataLoader(
         train_set_change,
         batch_size=args['train_batch_size'],
@@ -150,7 +151,7 @@ def main():
         prefetch_factor=2,
         drop_last=True,
     )
-    train_set_unchange = RS.Data('train', random_flip=True)
+    train_set_unchange = RS.Data('train', random_flip=True, use_multi_img_photometric=args['use_multi_img_photometric'])
     train_loader_unchange = DataLoader(
         train_set_unchange,
         batch_size=args['train_batch_size'],
@@ -162,7 +163,7 @@ def main():
         prefetch_factor=2,
         drop_last=True,
     )
-    val_set = RS.Data('val')
+    val_set = RS.Data('val', use_multi_img_photometric=False)
     val_loader = DataLoader(
         val_set,
         batch_size=args['val_batch_size'],

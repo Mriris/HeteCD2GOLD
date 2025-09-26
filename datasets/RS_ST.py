@@ -24,6 +24,85 @@ STD_B  = np.array([49.41,  49.41,  49.41])
 
 root = '/data/jingwei/yantingxuan/Datasets/CityCN/Split43'
 
+class MultiImgPhotoMetricDistortion:
+    """
+    多图像一致的光度扰动。
+
+    - 为一次样本内的多幅图像（如 A、B、C）采样同一组随机参数；
+    - 仅对指定索引的图像执行颜色域变换（默认对光学 A/C 生效，跳过 SAR B）。
+
+    参数说明（与 torchvision 定义一致）：
+    - brightness: 亮度扰动幅度，取值 b 表示在 [1-b, 1+b] 中采样因子
+    - contrast:   对比度扰动幅度，取值 c 表示在 [1-c, 1+c] 中采样因子
+    - saturation: 饱和度扰动幅度，取值 s 表示在 [1-s, 1+s] 中采样因子
+    - hue:        色调扰动幅度，取值 h 表示在 [-h, h] 中采样（h ∈ [0, 0.5]）
+    - apply_to_indices: 需要应用的图像索引元组/列表
+    """
+
+    def __init__(
+        self,
+        brightness: float = 0.3,
+        contrast: float = 0.3,
+        saturation: float = 0.3,
+        hue: float = 0.1,
+        apply_to_indices=(0, 2),
+    ) -> None:
+        self.brightness = float(max(0.0, brightness))
+        self.contrast = float(max(0.0, contrast))
+        self.saturation = float(max(0.0, saturation))
+        # hue 上限为 0.5（torchvision 约束）
+        self.hue = float(min(max(0.0, hue), 0.5))
+        if isinstance(apply_to_indices, (list, tuple)):
+            self.apply_to_indices = tuple(apply_to_indices)
+        else:
+            self.apply_to_indices = (0, 2)
+
+    def _sample_factors(self):
+        # 采样一组因子并随机排列处理顺序
+        factors = {}
+        if self.brightness > 0:
+            factors['brightness'] = 1.0 + (2.0 * random.random() - 1.0) * self.brightness
+        if self.contrast > 0:
+            factors['contrast'] = 1.0 + (2.0 * random.random() - 1.0) * self.contrast
+        if self.saturation > 0:
+            factors['saturation'] = 1.0 + (2.0 * random.random() - 1.0) * self.saturation
+        if self.hue > 0:
+            factors['hue'] = (2.0 * random.random() - 1.0) * self.hue
+
+        ops = ['brightness', 'contrast', 'saturation', 'hue']
+        random.shuffle(ops)
+        return factors, ops
+
+    def _apply_one(self, img: Image.Image, factors, ops) -> Image.Image:
+        out = img
+        for op in ops:
+            if op not in factors:
+                continue
+            if op == 'brightness':
+                out = F.adjust_brightness(out, factors['brightness'])
+            elif op == 'contrast':
+                out = F.adjust_contrast(out, factors['contrast'])
+            elif op == 'saturation':
+                # 仅对 RGB 图像有效
+                if out.mode in ('RGB', 'RGBA'):
+                    out = F.adjust_saturation(out, factors['saturation'])
+            elif op == 'hue':
+                if out.mode in ('RGB', 'RGBA'):
+                    out = F.adjust_hue(out, factors['hue'])
+        return out
+
+    def __call__(self, imgs):
+        if not isinstance(imgs, (list, tuple)) or len(imgs) == 0:
+            return imgs
+        factors, ops = self._sample_factors()
+        out_imgs = []
+        for idx, img in enumerate(imgs):
+            if idx in self.apply_to_indices:
+                out_imgs.append(self._apply_one(img, factors, ops))
+            else:
+                out_imgs.append(img)
+        return out_imgs
+
 class CDDataAugmentation:
 
     def __init__(
@@ -35,7 +114,8 @@ class CDDataAugmentation:
             with_random_crop=False,
             with_scale_random_crop=False,
             with_random_blur=False,
-            random_color_tf=False
+            random_color_tf=False,
+            with_multi_img_photometric=False
     ):
         self.img_size = img_size
         if self.img_size is None:
@@ -49,6 +129,11 @@ class CDDataAugmentation:
         self.with_scale_random_crop = with_scale_random_crop
         self.with_random_blur = with_random_blur
         self.random_color_tf = random_color_tf
+        self.with_multi_img_photometric = with_multi_img_photometric
+        self.photometric = (
+            MultiImgPhotoMetricDistortion(apply_to_indices=(0, 2))
+            if with_multi_img_photometric else None
+        )
     def transform(self, imgs, labels, to_tensor=True):
         """
         :param imgs: [ndarray,]
@@ -123,6 +208,10 @@ class CDDataAugmentation:
             radius = random.random()
             imgs = [img.filter(ImageFilter.GaussianBlur(radius=radius))
                     for img in imgs]
+
+        # 多图像一致的光度扰动（默认作用于 A/C）
+        if self.with_multi_img_photometric and random.random() > 0.5:
+            imgs = self.photometric(imgs)
 
         if self.random_color_tf and random.random() > 0.5:
             color_jitter = transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.3)
@@ -260,7 +349,7 @@ def read_RSimages(mode, rescale=False):
     return imgs_list_A, imgs_list_B, imgs_list_C, labels_A
 
 class Data(data.Dataset):
-    def __init__(self, mode, random_flip = False):
+    def __init__(self, mode, random_flip = False, use_multi_img_photometric: bool = False):
         self.random_flip = random_flip
         self.imgs_list_A, self.imgs_list_B, self.imgs_list_C, self.labels = read_RSimages(mode)
         self.mode = mode
@@ -270,7 +359,8 @@ class Data(data.Dataset):
                     with_random_vflip=True,
                     with_scale_random_crop=True,
                     with_random_blur=True,
-                    random_color_tf=True
+                    random_color_tf=(not use_multi_img_photometric),
+                    with_multi_img_photometric=use_multi_img_photometric
                 )
     def get_mask_name(self, idx):
         mask_name = os.path.split(self.imgs_list_A[idx])[-1]

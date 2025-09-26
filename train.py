@@ -18,7 +18,7 @@ os.environ['CUDA_VISIBLE_DEVICES'] = '1'
 #Data and model choose
 torch.set_num_threads(4)
 
-# 性能加速：TF32 与禁用 Inductor autotune（减少编译与运行开销）
+# TF32与禁用Inductor autotune减少编译与运行开销
 os.environ.setdefault('TORCHINDUCTOR_MAX_AUTOTUNE', '0')
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -38,7 +38,7 @@ def setup_seed(seed):
      np.random.seed(seed)
      random.seed(seed)
     #  torch.backends.cudnn.deterministic = True
-# # 设置随机数种子
+# 设置随机数种子
 setup_seed(seed)
 # from models.SSCDl import SSCDl as Net
 NET_NAME = 'Tgold'
@@ -114,8 +114,14 @@ def main():
 #------------------------------------------------------#
 #   显示没有匹配上的Key
 #------------------------------------------------------#
-    print("\nSuccessful Load Key:", str(load_key)[:5000], "……\nSuccessful Load Key Num:", len(load_key))
-    print("\nFail To Load Key:", str(no_load_key)[:5000], "……\nFail To Load Key num:", len(no_load_key))
+    if len(load_key) == 0:
+        print("没有匹配上的Key")
+    else:
+        print("\n匹配成功的Key:", str(load_key)[:5000], "……\n匹配成功的Key Num:", len(load_key))
+    if len(no_load_key) == 0:
+        print("所有Key都已匹配")
+    else:
+        print("\n匹配失败的Key:", str(no_load_key)[:5000], "……\n匹配失败的Key num:", len(no_load_key))
     model_dict.update(temp_dict)
     net.load_state_dict(model_dict)
     

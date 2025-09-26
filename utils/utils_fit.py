@@ -335,7 +335,7 @@ def validate(val_loader, net, criterion, curr_epoch, args):
             imgs_B = imgs_B.contiguous(memory_format=torch.channels_last)
             imgs_C = imgs_C.contiguous(memory_format=torch.channels_last)
 
-        with torch.no_grad():
+        with torch.inference_mode():
             # 验证也使用 AMP（与训练一致）
             use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
             with torch.amp.autocast('cuda', dtype=torch.bfloat16 if use_bf16 else torch.float16):

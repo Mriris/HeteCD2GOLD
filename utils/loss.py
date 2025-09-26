@@ -1,6 +1,5 @@
 import torch
 import torch.nn.functional as F
-from torch.autograd import Variable
 import torch.nn as nn
 import numpy as np
 # Recommend
@@ -264,14 +263,13 @@ class CrossEntropyLoss2d(nn.Module):
     def __init__(self, weight=None, ignore_index=-1):
         super(CrossEntropyLoss2d, self).__init__()
         self.nll_loss = nn.NLLLoss(weight=weight, ignore_index=ignore_index,
-                                   reduction='elementwise_mean')
+                                   reduction='mean')
 
     def forward(self, inputs, targets):
         return self.nll_loss(F.log_softmax(inputs, dim=1), targets)
 
 
-# this may be unstable sometimes.Notice set the size_average
-def CrossEntropy2d(input, target, weight=None, size_average=False):
+def CrossEntropy2d(input, target, weight=None, reduction='mean'):
     # input:(n, c, h, w) target:(n, h, w)
     n, c, h, w = input.size()
 
@@ -280,10 +278,8 @@ def CrossEntropy2d(input, target, weight=None, size_average=False):
 
     target_mask = target >= 0
     target = target[target_mask]
-    #loss = F.nll_loss(F.log_softmax(input), target, weight=weight, size_average=False)
-    loss = F.cross_entropy(input, target, weight=weight, size_average=False)
-    if size_average:
-        loss /= target_mask.sum().data[0]
+    #loss = F.nll_loss(F.log_softmax(input), target, weight=weight, reduction=reduction)
+    loss = F.cross_entropy(input, target, weight=weight, reduction=reduction)
 
     return loss
     
@@ -329,11 +325,11 @@ class FocalLoss(nn.Module):
         return loss
 
 class FocalLoss2d(nn.Module):
-    def __init__(self, gamma=0, weight=None, size_average=True, ignore_index=-1):
+    def __init__(self, gamma=0, weight=None, reduction='mean', ignore_index=-1):
         super(FocalLoss2d, self).__init__()
         self.gamma = gamma
         self.weight = weight
-        self.size_average = size_average
+        self.reduction = reduction
         self.ignore_index = ignore_index
 
     def forward(self, input, target):
@@ -351,18 +347,19 @@ class FocalLoss2d(nn.Module):
             target = target.view(-1, 1)
 
         # compute the negative likelyhood
-        weight = Variable(self.weight)
         logpt = -F.cross_entropy(input, target, ignore_index=self.ignore_index)
         pt = torch.exp(logpt)
 
         # compute the loss
         loss = -((1-pt)**self.gamma) * logpt
 
-        # averaging (or not) loss
-        if self.size_average:
+        # apply reduction
+        if self.reduction == 'mean':
             return loss.mean()
-        else:
+        elif self.reduction == 'sum':
             return loss.sum()
+        else:
+            return loss
 
 class ChangeSimilarity(nn.Module):
     """input: x1, x2 multi-class predictions, c = class_num

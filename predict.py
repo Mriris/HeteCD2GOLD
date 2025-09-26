@@ -201,7 +201,7 @@ def predict(net, test_dir, pred_dir):
         img_A = FF.to_tensor(img_A).cuda().float().unsqueeze(0)
         img_B = FF.to_tensor(img_B).cuda().float().unsqueeze(0)
         
-        with torch.no_grad():
+        with torch.inference_mode():
             # for i in range(100):
             #     t1 = time.time()
             #     out_change, features = net(img_A, img_B)

@@ -2,6 +2,7 @@ import torch
 import torch.nn.functional as F
 import torch.nn as nn
 import numpy as np
+import math
 # Recommend
 import torch.nn.functional as F
 
@@ -539,3 +540,143 @@ class DiceLoss(nn.Module):
                 total_loss += dice_loss
 
         return total_loss/target.shape[1]
+
+
+class DifferenceAttentionDistillationLoss(nn.Module):
+    """差异图注意力蒸馏（Difference-map guided Attention Distillation）。
+
+    设计目标：利用“差异图 D”引导，跨师生网络对齐空间注意力与通道注意力，
+    面向异源变化检测，缓解模态差异并增强可解释性。
+
+    输入约定：
+      - student_features: [[f_c3_pre, f_c4_pre], [f_c3_post, f_c4_post]]
+      - teacher_features: [[f_c3_pre, f_c4_pre], [f_c3_post, f_c4_post]]
+        其中两个列表分别对应同一网络分支的两时相特征；索引 0/1 对应两个尺度（c3/c4）。
+
+    输出：map_loss, sp_loss, ch_loss（逐尺度平均后返回）。
+    """
+
+    def __init__(self, eps: float = 1e-6, spatial_kernel_size: int = 7, use_confidence_weight: bool = True):
+        super(DifferenceAttentionDistillationLoss, self).__init__()
+        self.eps = eps
+        self.ks = spatial_kernel_size
+        self.use_confidence_weight = use_confidence_weight
+
+    def _ensure_same_hw(self, a: torch.Tensor, b: torch.Tensor) -> tuple:
+        if a.size(-2) != b.size(-2) or a.size(-1) != b.size(-1):
+            dsize = (max(a.size(-2), b.size(-2)), max(a.size(-1), b.size(-1)))
+            b = F.interpolate(b, dsize, mode='bilinear', align_corners=False)
+        return a, b
+
+    def _diff_map(self, f1: torch.Tensor, f2: torch.Tensor) -> torch.Tensor:
+        """计算差异图 D，输出形状 (N, 1, H, W)，范围约在 [0,1]。"""
+        f1, f2 = self._ensure_same_hw(f1, f2)
+        diff = f1 - f2
+        d_l2 = torch.sqrt(torch.clamp((diff * diff).sum(dim=1, keepdim=True), min=self.eps))
+        # 归一化L2距离，使其相对于特征幅度
+        f1_norm = torch.norm(f1, p=2, dim=1, keepdim=True) + self.eps
+        f2_norm = torch.norm(f2, p=2, dim=1, keepdim=True) + self.eps
+        d_l2_norm = d_l2 / (0.5 * (f1_norm + f2_norm) + self.eps)
+        
+        # 方向差异（余弦项）
+        cos_sim = torch.clamp((f1 * f2).sum(dim=1, keepdim=True) / (f1_norm * f2_norm), min=-1.0, max=1.0)
+        d_cos = 1.0 - cos_sim
+        
+        # 组合两种差异度量并归一化
+        d = 0.5 * (torch.tanh(d_l2_norm) + 0.5 * d_cos)
+        d = torch.sigmoid(2.0 * d)  # 使用sigmoid替代tanh变换，确保[0,1]范围
+        return d
+
+    def _spatial_attention(self, f: torch.Tensor) -> torch.Tensor:
+        """参数无关的空间注意力，近似 CBAM 空间注意力：
+        A_sp = sigmoid(AvgPool2d(mean_c(F)) + AvgPool2d(max_c(F))). 输出 (N,1,H,W)
+        """
+        mean_c = torch.mean(f, dim=1, keepdim=True)
+        max_c, _ = torch.max(f, dim=1, keepdim=True)
+        if self.ks and self.ks > 1:
+            pad = (self.ks - 1) // 2
+            mean_s = F.avg_pool2d(mean_c, kernel_size=self.ks, stride=1, padding=pad)
+            max_s = F.avg_pool2d(max_c, kernel_size=self.ks, stride=1, padding=pad)
+        else:
+            mean_s, max_s = mean_c, max_c
+        a_sp = torch.sigmoid(mean_s + max_s)
+        return a_sp
+
+    def _channel_attention(self, f: torch.Tensor) -> torch.Tensor:
+        """参数无关的通道注意力，近似 SE/CBAM 通道分支：
+        A_ch = sigmoid(AvgPool_hw(F) + MaxPool_hw(F)). 输出 (N,C)
+        """
+        avg_pool = F.adaptive_avg_pool2d(f, 1).squeeze(-1).squeeze(-1)
+        max_pool = F.adaptive_max_pool2d(f, 1).squeeze(-1).squeeze(-1)
+        a_ch = torch.sigmoid(avg_pool + max_pool)
+        return a_ch
+
+    def _weighted_mse(self, x: torch.Tensor, y: torch.Tensor, weight: torch.Tensor = None) -> torch.Tensor:
+        x, y = self._ensure_same_hw(x, y)
+        if weight is not None:
+            weight, _ = self._ensure_same_hw(weight, x)
+            diff2 = (x - y) * (x - y)
+            # 按权重归一化：避免被未变化区域稀释
+            num = (diff2 * weight).sum()
+            den = weight.sum() + self.eps
+            return num / den
+        return F.mse_loss(x, y, reduction='mean')
+
+    def forward(self, student_features: list, teacher_features: list, teacher_pred: torch.Tensor = None) -> tuple:
+        assert isinstance(student_features, (list, tuple)) and isinstance(teacher_features, (list, tuple))
+        assert len(student_features) == 2 and len(teacher_features) == 2
+
+        total_map = 0.0
+        total_sp = 0.0
+        total_ch = 0.0
+        scale_count = 0
+
+        for i in range(len(student_features[0])):
+            # 学生/教师的成对特征（pre/post）
+            s_pre = student_features[0][i]
+            s_post = student_features[1][i]
+            t_pre = teacher_features[0][i]
+            t_post = teacher_features[1][i]
+
+            # 差异图
+            d_s = self._diff_map(s_pre, s_post)
+            d_t = self._diff_map(t_pre, t_post)
+
+            # 置信加权：默认使用教师差异强度作为像素权重；若提供 teacher_pred 可进一步融合其置信度
+            weight_map = d_t.detach()
+            if self.use_confidence_weight and (teacher_pred is not None):
+                # teacher 置信度（归一化熵）：conf in [0,1]
+                with torch.no_grad():
+                    prob = torch.softmax(teacher_pred, dim=1)
+                    num_classes = float(prob.size(1))
+                    entropy = -(prob * torch.clamp(torch.log(prob + self.eps), min=-1e3, max=1e3)).sum(dim=1, keepdim=True)
+                    max_entropy = math.log(num_classes + self.eps)
+                    if max_entropy > 0:
+                        entropy = entropy / max_entropy
+                        conf = 1.0 - entropy  # (N,1,H,W)
+                        conf = torch.clamp(conf, min=0.0, max=1.0)  # 确保置信度在合理范围内
+                        conf = F.interpolate(conf, size=d_t.shape[-2:], mode='bilinear', align_corners=False)
+                        weight_map = weight_map * (0.5 + 0.5 * conf)  # 避免权重为0，保持基础权重
+
+            # 空间/通道注意力（使用融合特征）
+            s_fused = 0.5 * (s_pre + s_post)
+            t_fused = 0.5 * (t_pre + t_post)
+            a_sp_s = self._spatial_attention(s_fused)
+            a_sp_t = self._spatial_attention(t_fused)
+            a_ch_s = self._channel_attention(s_fused)
+            a_ch_t = self._channel_attention(t_fused)
+
+            # 损失
+            map_loss_i = self._weighted_mse(d_s, d_t, weight=weight_map)
+            sp_loss_i = self._weighted_mse(a_sp_s, a_sp_t, weight=weight_map)
+            # 通道注意力使用逐通道 MSE
+            # 对齐批维
+            ch_loss_i = F.mse_loss(a_ch_s, a_ch_t, reduction='mean')
+
+            total_map = total_map + map_loss_i
+            total_sp = total_sp + sp_loss_i
+            total_ch = total_ch + ch_loss_i
+            scale_count += 1
+
+        denom = max(scale_count, 1)
+        return total_map / denom, total_sp / denom, total_ch / denom

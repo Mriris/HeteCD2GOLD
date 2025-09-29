@@ -18,6 +18,7 @@ from utils.loss import (
     Dice_loss,
     FeatureConsistencyLoss,
     MaskedFeatureMSELoss,
+    DifferenceAttentionDistillationLoss,
 )
 from utils.utils import AverageMeter, get_confuse_matrix, cm2score
 
@@ -41,6 +42,12 @@ DEFAULT_LOSS_WEIGHTS = {
     'feat_kd_weight': 0.5,
     'feat_kd_pos': 3.0,
     'feat_kd_neg': 1.0,
+    'attD_enable': True,
+    'attD_weight': 0.5,
+    'attD_map_w': 0.6,
+    'attD_ch_w': 0.25,
+    'attD_sp_w': 0.15,
+    'attD_warmup_epochs': 12,
 }
 
 
@@ -79,6 +86,7 @@ def train(train_loader, train_loader_unchange, net, criterion, optimizer, schedu
     al_loss = AlignmentLoss()
     feat_kd_loss = MaskedFeatureMSELoss()
     fc_loss = FeatureConsistencyLoss()
+    att_distill_loss = DifferenceAttentionDistillationLoss()
 
     loss_weights = copy.deepcopy(DEFAULT_LOSS_WEIGHTS)
     loss_weights.update(args.get('loss_weights', {}))
@@ -108,8 +116,20 @@ def train(train_loader, train_loader_unchange, net, criterion, optimizer, schedu
         train_loss_align_teacher = AverageMeter()
         train_loss_dice = AverageMeter()
         train_loss_feat_kd = AverageMeter()
+        train_loss_attD_map = AverageMeter()
+        train_loss_attD_sp = AverageMeter()
+        train_loss_attD_ch = AverageMeter()
         train_loss_teacher_dice = AverageMeter()
         train_loss_teacher_ce = AverageMeter()
+        
+        # 计算当前epoch的attention distillation权重（用于日志输出）
+        epoch_attD_weight = 0.0
+        if loss_weights.get('attD_enable', True):
+            warmup_att = loss_weights.get('attD_warmup_epochs', 0)
+            if warmup_att and warmup_att > 0:
+                epoch_attD_weight = loss_weights['attD_weight'] * min(1.0, (curr_epoch + 1) / float(warmup_att))
+            else:
+                epoch_attD_weight = loss_weights['attD_weight']
 
         curr_iter = curr_epoch * len(train_loader)
         kd_lambda = _compute_kd_weight(curr_epoch, loss_weights)
@@ -182,6 +202,20 @@ def train(train_loader, train_loader_unchange, net, criterion, optimizer, schedu
                     else:
                         train_loss_teacher_dice.update(0.0)
 
+                    # 差异图注意力蒸馏
+                    attD_map = 0.0
+                    attD_sp = 0.0
+                    attD_ch = 0.0
+                    if loss_weights.get('attD_enable', True) and epoch_attD_weight > 0.0:
+                        attD_map, attD_sp, attD_ch = att_distill_loss(student_features, teacher_features, teacher_pred)
+                        attD_total = (
+                            loss_weights.get('attD_map_w', 0.5) * attD_map
+                            + loss_weights.get('attD_ch_w', 0.3) * attD_ch
+                            + loss_weights.get('attD_sp_w', 0.2) * attD_sp
+                        )
+                    else:
+                        attD_total = 0.0
+
                     loss = (
                         loss_ce
                         + teacher_lambda * loss_teacher
@@ -191,6 +225,7 @@ def train(train_loader, train_loader_unchange, net, criterion, optimizer, schedu
                             loss_weights['align_scale_student'] * align_loss_student
                             + loss_weights['align_scale_teacher'] * align_loss_teacher
                         )
+                        + epoch_attD_weight * attD_total
                     )
 
                     train_loss_ce.update(loss_ce.item())
@@ -200,6 +235,10 @@ def train(train_loader, train_loader_unchange, net, criterion, optimizer, schedu
                     train_loss_align_student.update(align_loss_student.item())
                     train_loss_align_teacher.update(align_loss_teacher.item())
                     train_loss_feat_kd.update(feat_kd.item())
+                    if loss_weights.get('attD_enable', True):
+                        train_loss_attD_map.update(float(attD_map))
+                        train_loss_attD_sp.update(float(attD_sp))
+                        train_loss_attD_ch.update(float(attD_ch))
                     if args['dice']:
                         train_loss_dice.update(dice_loss_val)
 
@@ -228,6 +267,9 @@ def train(train_loader, train_loader_unchange, net, criterion, optimizer, schedu
                     train_loss_kd.update(0.0)
                     train_loss_align_teacher.update(0.0)
                     train_loss_feat_kd.update(0.0)
+                    train_loss_attD_map.update(0.0)
+                    train_loss_attD_sp.update(0.0)
+                    train_loss_attD_ch.update(0.0)
                     train_loss_teacher_dice.update(0.0)
                     train_loss_teacher_ce.update(0.0)
 
@@ -271,8 +313,14 @@ def train(train_loader, train_loader_unchange, net, criterion, optimizer, schedu
                 train_loss_feat_kd.average(), train_loss_align_student.average(), train_loss_align_teacher.average()))
             if args['dice']:
                 f.write(', Dice=%.4f' % train_loss_dice.average())
-            f.write(', Epoch_align_weight=%.4f, Epoch_teacher_weight=%.6f, Epoch_kd_weight=%.6f\n' % (
+            if loss_weights.get('attD_enable', True):
+                f.write(', AttD_map=%.4f, AttD_sp=%.4f, AttD_ch=%.4f' % (
+                    train_loss_attD_map.average(), train_loss_attD_sp.average(), train_loss_attD_ch.average()))
+            f.write(', Epoch_align_weight=%.4f, Epoch_teacher_weight=%.6f, Epoch_kd_weight=%.6f' % (
                 epoch_align_weight, teacher_lambda, kd_lambda))
+            if loss_weights.get('attD_enable', True):
+                f.write(', Epoch_attD_weight=%.6f' % epoch_attD_weight)
+            f.write('\n')
 
         print('Epoch: %d  Total time: %.1fs  Train loss %.4f  score %s' % (
             curr_epoch, time.time() - begin_time, train_loss.average(), {k: score_train[k] for k in score_train}))
@@ -281,6 +329,9 @@ def train(train_loader, train_loader_unchange, net, criterion, optimizer, schedu
             train_loss_feat_kd.average(), train_loss_align_student.average(), train_loss_align_teacher.average()), end='')
         if args['dice']:
             print(', Dice=%.4f' % train_loss_dice.average(), end='')
+        if loss_weights.get('attD_enable', True):
+            print(', AttD_map=%0.4f, AttD_sp=%0.4f, AttD_ch=%0.4f' % (
+                train_loss_attD_map.average(), train_loss_attD_sp.average(), train_loss_attD_ch.average()), end='')
         print(', Epoch_align_weight=%.4f, Epoch_teacher_weight=%.6f, Epoch_kd_weight=%.6f' % (
             epoch_align_weight, teacher_lambda, kd_lambda))
 

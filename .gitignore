@@ -2,7 +2,7 @@
 *__pycache__*
 checkpoints/
 .idea/
-doc/personal/article.md
+doc/personal/
 AGENTS.md
 open-cd/
 *.log*

@@ -41,9 +41,9 @@ def setup_seed(seed):
 # 设置随机数种子
 setup_seed(seed)
 # from models.SSCDl import SSCDl as Net
-NET_NAME = 'Tgold'
+NET_NAME = 'gold'
 DATA_NAME = 'trios43'
-EXP_NAME = "EXP"+time.strftime('%Y%m%d%H%M%S',time.localtime(time.time()))+"MSE"
+EXP_NAME = "EXP"+time.strftime('%Y%m%d%H%M%S',time.localtime(time.time()))+"MSE+DA|MultiImgPhotoMetric"
 ###############################################    
 #Training options
 ###############################################

@@ -14,7 +14,7 @@ working_path = os.path.dirname(os.path.abspath(__file__))
 from utils.utils_fit import train
 from utils.loss import CrossEntropyLoss2d, weighted_BCE_logits, ChangeSimilarity,SCA_Loss,FeatureConsistencyLoss
 from utils.utils import accuracy, SCDD_eval_all, AverageMeter, get_confuse_matrix, cm2score
-os.environ['CUDA_VISIBLE_DEVICES'] = '1'
+os.environ['CUDA_VISIBLE_DEVICES'] = '1,2,3'
 #Data and model choose
 torch.set_num_threads(4)
 
@@ -41,8 +41,8 @@ def setup_seed(seed):
 # 设置随机数种子
 setup_seed(seed)
 # from models.SSCDl import SSCDl as Net
-NET_NAME = 'gold'
-DATA_NAME = 'trios43'
+NET_NAME = 'Tgold'
+DATA_NAME = 'test'
 EXP_NAME = "EXP"+time.strftime('%Y%m%d%H%M%S',time.localtime(time.time()))+"MSE+DA|MultiImgPhotoMetric"
 ###############################################    
 #Training options
@@ -133,11 +133,15 @@ def main():
     print(f"缓存内存: {torch.cuda.memory_reserved(device) / (1024**3):.2f} GB")
     print(f"可用内存: {(torch.cuda.get_device_properties(device).total_memory - torch.cuda.memory_reserved(device)) / (1024**3):.2f} GB")
     # 在加载权重后启用编译以降低 Python/框架开销
-    try:
-        net.module = torch.compile(net.module, mode='reduce-overhead')
-        print("已启用 torch.compile(mode='reduce-overhead')")
-    except Exception as e:
-        print(f"torch.compile 跳过：{e}")
+    # 仅单卡时启用，因为多卡时与 DataParallel 冲突
+    if torch.cuda.device_count() <= 1:
+        try:
+            net = torch.compile(net, mode='reduce-overhead')
+            print("已启用 torch.compile(mode='reduce-overhead')")
+        except Exception as e:
+            print(f"torch.compile 跳过：{e}")
+    else:
+        print("检测到多GPU，已跳过 torch.compile 以避免与 DataParallel 冲突")
         
     train_set_change = RS.Data('train', random_flip=True, use_multi_img_photometric=args['use_multi_img_photometric'])
     train_loader_change = DataLoader(

@@ -26,6 +26,50 @@ from utils.utils import AverageMeter, get_confuse_matrix, cm2score
 warnings.filterwarnings("ignore", message=".*low contrast image.*")
 
 
+# 断点保存工具函数
+def save_checkpoint(
+    chkpt_dir: str,
+    net: nn.Module,
+    optimizer,
+    scheduler,
+    scaler,
+    epoch: int,
+    best_iou: float,
+    best_loss: float,
+    net_name: str,
+    is_best: bool = False,
+) -> None:
+    """
+    保存训练断点与最佳模型。
+
+    - 始终写入 last_checkpoint.pth（包含模型、优化器、调度器、AMP 状态等）。
+    - 当 is_best=True 时，同时写入 best_checkpoint.pth 与带 IoU 的模型权重（仅 state_dict，后缀 .pth）。
+    """
+    os.makedirs(chkpt_dir, exist_ok=True)
+
+    checkpoint = {
+        'epoch': epoch,
+        'best_iou': float(best_iou),
+        'best_loss': float(best_loss),
+        'model_state': net.state_dict(),
+        'optimizer_state': optimizer.state_dict() if optimizer is not None else None,
+        'scheduler_state': scheduler.state_dict() if scheduler is not None else None,
+        'scaler_state': scaler.state_dict() if scaler is not None else None,
+    }
+
+    last_path = os.path.join(chkpt_dir, 'last_checkpoint.pth')
+    torch.save(checkpoint, last_path)
+
+    if is_best:
+        best_ckpt_path = os.path.join(chkpt_dir, 'best_checkpoint.pth')
+        torch.save(checkpoint, best_ckpt_path)
+        # 仅保存权重（兼容推理脚本）
+        best_sd_path = os.path.join(
+            chkpt_dir,
+            f"{net_name}_{epoch}IoU{best_iou * 100:.2f}.pth",
+        )
+        torch.save(net.state_dict(), best_sd_path)
+
 # 损失权重配置
 DEFAULT_LOSS_WEIGHTS = {
     'kd_weight': 5e-3,
@@ -92,7 +136,8 @@ def train(train_loader, train_loader_unchange, net, criterion, optimizer, schedu
     loss_weights.update(args.get('loss_weights', {}))
     args['loss_weights'] = loss_weights
 
-    curr_epoch = 0
+    # 支持从外部指定的起始 epoch（用于断点续训）
+    curr_epoch = int(args.get('start_epoch', 0))
     if curr_epoch == 0:
         with open(os.path.join(args['log_dir'] + args['log_name']), 'a') as f:
             f.write('=' * 80 + '\n')
@@ -104,6 +149,13 @@ def train(train_loader, train_loader_unchange, net, criterion, optimizer, schedu
     # AMP：优先 BF16，不支持则使用 FP16 + GradScaler
     use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
     scaler = torch.amp.GradScaler('cuda') if not use_bf16 else None
+    # 恢复 AMP Scaler 状态（如存在）
+    scaler_state = args.get('scaler_state', None)
+    if scaler is not None and scaler_state is not None:
+        try:
+            scaler.load_state_dict(scaler_state)
+        except Exception:
+            pass
 
     while True:
         net.train()
@@ -344,15 +396,34 @@ def train(train_loader, train_loader_unchange, net, criterion, optimizer, schedu
                 io.imsave(os.path.join(args['pred_dir'], "train_" + name), vis_img)
 
         score_val, loss_val, val_preds, val_labels, val_names = validate(val_loader, net, criterion, curr_epoch, args)
-        if score_val['iou_1'] > bestiou:
+        # 判断是否刷新最佳指标
+        improved = score_val['iou_1'] > bestiou
+        if improved:
             bestiou = score_val['iou_1']
             bestloss = loss_val
-            torch.save(net.state_dict(), os.path.join(args['chkpt_dir'], NET_NAME + '_%dIoU%.2f' % (curr_epoch, score_val['iou_1'] * 100)))
             for pred, label, name in zip(val_preds, val_labels, val_names):
                 pred = pred.astype(np.uint8) * 255
                 label = label.astype(np.uint8) * 255
                 vis_img = np.concatenate([pred, label], axis=1)
                 io.imsave(os.path.join(args['pred_dir'], "val_" + name), vis_img)
+
+        # 保存 last_checkpoint（以及可能的最佳权重）
+        try:
+            save_checkpoint(
+                chkpt_dir=args['chkpt_dir'],
+                net=net,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                scaler=scaler,
+                epoch=curr_epoch,
+                best_iou=bestiou,
+                best_loss=bestloss,
+                net_name=NET_NAME,
+                is_best=improved,
+            )
+        except Exception:
+            # 保存失败不影响训练继续
+            pass
 
         with open(os.path.join(args['log_dir'] + args['log_name']), 'a') as f:
             f.write('Epoch: %d  Total time: %.1fs  Val iou %.2f  loss %.4f\n' % (

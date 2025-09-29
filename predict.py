@@ -162,10 +162,16 @@ def main():
     opt = PredOptions().parse()
     net = Net(3).cuda()
     checkpoint = torch.load(opt.chkpt_path, map_location='cuda:0')
-    #打印checkpoint中的层名
-    new_state_dict = {k[7:] if k.startswith('module.') else k: v for k, v in checkpoint.items()}
-    
-    net.load_state_dict(new_state_dict,strict=False)
+    # 兼容两种格式：
+    # 1) 仅 state_dict（原逻辑）
+    # 2) 封装字典，包含 'model_state'
+    if isinstance(checkpoint, dict) and 'model_state' in checkpoint:
+        state_dict_in = checkpoint['model_state']
+    else:
+        state_dict_in = checkpoint
+    # 去除可能的 DataParallel 前缀
+    new_state_dict = {k[7:] if k.startswith('module.') else k: v for k, v in state_dict_in.items()}
+    net.load_state_dict(new_state_dict, strict=False)
 
     net.eval()
 

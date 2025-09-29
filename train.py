@@ -14,7 +14,7 @@ working_path = os.path.dirname(os.path.abspath(__file__))
 from utils.utils_fit import train
 from utils.loss import CrossEntropyLoss2d, weighted_BCE_logits, ChangeSimilarity,SCA_Loss,FeatureConsistencyLoss
 from utils.utils import accuracy, SCDD_eval_all, AverageMeter, get_confuse_matrix, cm2score
-os.environ['CUDA_VISIBLE_DEVICES'] = '1,2,3'
+os.environ['CUDA_VISIBLE_DEVICES'] = '1'
 #Data and model choose
 torch.set_num_threads(4)
 
@@ -42,7 +42,7 @@ def setup_seed(seed):
 setup_seed(seed)
 # from models.SSCDl import SSCDl as Net
 NET_NAME = 'Tgold'
-DATA_NAME = 'test'
+DATA_NAME = 'trios43'
 EXP_NAME = "EXP"+time.strftime('%Y%m%d%H%M%S',time.localtime(time.time()))+"MSE+DA|MultiImgPhotoMetric"
 ###############################################    
 #Training options
@@ -67,12 +67,12 @@ args = {
     'log_dir': os.path.join(working_path, 'checkpoints', NET_NAME,DATA_NAME, EXP_NAME),
     'load_path': os.path.join(working_path, 'checkpoints', DATA_NAME, 'pretrained.pth'),
     'use_multi_img_photometric': True,
+    # 断点续训相关配置：仅当提供 resume_path 时启用
+    # 'resume_path': None,
+    'resume_path': r'/data/jingwei/yantingxuan/0Program/HeteCD2GOLD/checkpoints/Tgold/trios43/EXP20250929201335MSE+DA|MultiImgPhotoMetric',
 }
 ###############################################
 
-if not os.path.exists(args['log_dir']): os.makedirs(args['log_dir'])
-if not os.path.exists(args['pred_dir']): os.makedirs(args['pred_dir'])
-if not os.path.exists(args['chkpt_dir']): os.makedirs(args['chkpt_dir'])
 # writer = SummaryWriter(args['log_dir'])
 #日期时间作为日志文件名
 args['log_name']="/log.txt"
@@ -94,37 +94,82 @@ def main():
     net = Net(3).cuda()
     # 保持输入为 channels_last，模型不整体转换，避免 rank 不一致错误
     net = nn.DataParallel(net)
-    model_dict      = net.state_dict()
-    pretrained_dict = torch.load("backbone_weights.pth")
-    load_key, no_load_key, temp_dict = [], [], {}
-    for k, v in pretrained_dict.items():
-        if "backbone" in k:
-            # 映射到光学编码器和SAR编码器
-            k1 = k.replace("backbone.", "optical_encoder.")
-            k2 = k.replace("backbone.", "sar_encoder.")
-            if k1 in model_dict.keys() and np.shape(model_dict[k1]) == np.shape(v):
-                temp_dict[k1] = v
-                load_key.append(k1)
-            if k2 in model_dict.keys() and np.shape(model_dict[k2]) == np.shape(v):
-                temp_dict[k2] = v
-                load_key.append(k2)
+
+    # ============ 目录与恢复/加载权重逻辑 ============
+    resume_path = args.get('resume_path', None)
+    # 若提供 resume_path，支持两种形式：
+    # 1) 指向实验目录；2) 指向具体 checkpoint 文件
+    if resume_path is not None:
+        if os.path.isdir(resume_path):
+            exp_dir = resume_path
         else:
-            no_load_key.append(k)
-    model_dict.update(temp_dict)
-    net.load_state_dict(model_dict)
-#------------------------------------------------------#
-#   显示没有匹配上的Key
-#------------------------------------------------------#
-    if len(load_key) == 0:
-        print("没有匹配上的Key")
-    else:
-        print("\n匹配成功的Key:", str(load_key)[:5000], "……\n匹配成功的Key Num:", len(load_key))
-    if len(no_load_key) == 0:
-        print("所有Key都已匹配")
-    else:
-        print("\n匹配失败的Key:", str(no_load_key)[:5000], "……\n匹配失败的Key num:", len(no_load_key))
-    model_dict.update(temp_dict)
-    net.load_state_dict(model_dict)
+            exp_dir = os.path.dirname(resume_path)
+        args['exp_name'] = os.path.basename(exp_dir)
+        args['chkpt_dir'] = exp_dir
+        args['log_dir'] = exp_dir
+        args['pred_dir'] = os.path.join(exp_dir, 'vis')
+
+    # 在目录对齐后再创建目录
+    if not os.path.exists(args['log_dir']): os.makedirs(args['log_dir'])
+    if not os.path.exists(args['pred_dir']): os.makedirs(args['pred_dir'])
+    if not os.path.exists(args['chkpt_dir']): os.makedirs(args['chkpt_dir'])
+    did_resume = False
+    if resume_path is not None:
+        ckpt_path = resume_path
+        if os.path.isdir(ckpt_path):
+            ckpt_path = os.path.join(ckpt_path, 'last_checkpoint.pth')
+        if os.path.isfile(ckpt_path):
+            print(f"检测到断点文件，尝试从 {ckpt_path} 恢复训练……")
+        try:
+            checkpoint = torch.load(ckpt_path, map_location='cuda:0')
+            # 模型权重（DataParallel 下键包含 module. 前缀）
+            model_state = checkpoint.get('model_state', None)
+            if model_state is None:
+                # 兼容仅有 state_dict 的保存
+                model_state = checkpoint
+            net.load_state_dict(model_state, strict=False)
+            # 起始 epoch 与 AMP scaler 状态传递到 args，由训练循环接收
+            args['start_epoch'] = int(checkpoint.get('epoch', -1)) + 1 if isinstance(checkpoint, dict) else 0
+            args['scaler_state'] = checkpoint.get('scaler_state', None) if isinstance(checkpoint, dict) else None
+            # 将优化器/调度器状态暂存，以便创建后恢复
+            args['optimizer_state'] = checkpoint.get('optimizer_state', None) if isinstance(checkpoint, dict) else None
+            args['scheduler_state'] = checkpoint.get('scheduler_state', None) if isinstance(checkpoint, dict) else None
+            did_resume = True
+            print(f"恢复完成：从 epoch {args.get('start_epoch', 0)} 继续训练。")
+        except Exception as e:
+            print(f"断点恢复失败：{e}，将按预训练权重初始化。")
+
+    if not did_resume:
+        # 未恢复时，按 backbone 预训练权重映射加载
+        model_dict      = net.state_dict()
+        pretrained_dict = torch.load("backbone_weights.pth")
+        load_key, no_load_key, temp_dict = [], [], {}
+        for k, v in pretrained_dict.items():
+            if "backbone" in k:
+                # 映射到光学编码器和SAR编码器
+                k1 = k.replace("backbone.", "optical_encoder.")
+                k2 = k.replace("backbone.", "sar_encoder.")
+                if k1 in model_dict.keys() and np.shape(model_dict[k1]) == np.shape(v):
+                    temp_dict[k1] = v
+                    load_key.append(k1)
+                if k2 in model_dict.keys() and np.shape(model_dict[k2]) == np.shape(v):
+                    temp_dict[k2] = v
+                    load_key.append(k2)
+            else:
+                no_load_key.append(k)
+        model_dict.update(temp_dict)
+        net.load_state_dict(model_dict)
+        #------------------------------------------------------#
+        #   显示没有匹配上的Key
+        #------------------------------------------------------#
+        if len(load_key) == 0:
+            print("没有匹配上的Key")
+        else:
+            print("\n匹配成功的Key:", str(load_key)[:5000], "……\n匹配成功的Key Num:", len(load_key))
+        if len(no_load_key) == 0:
+            print("所有Key都已匹配")
+        else:
+            print("\n匹配失败的Key:", str(no_load_key)[:5000], "……\n匹配失败的Key num:", len(no_load_key))
     
     # 显示模型加载后的内存使用情况
     device = torch.cuda.current_device()
@@ -199,6 +244,16 @@ def main():
         three_phase=False,
     )
     args['use_onecycle'] = True
+
+    # 若来自断点，恢复优化器/调度器状态
+    if did_resume:
+        try:
+            if args.get('optimizer_state') is not None:
+                optimizer.load_state_dict(args['optimizer_state'])
+            if args.get('scheduler_state') is not None:
+                scheduler.load_state_dict(args['scheduler_state'])
+        except Exception as e:
+            print(f"优化器/调度器状态恢复失败：{e}")
 
     train(train_loader_change, train_loader_unchange,net, criterion, optimizer, scheduler, val_loader, args)
     print('Training finished.')

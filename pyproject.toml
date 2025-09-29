@@ -1,0 +1,16 @@
+[project]
+name = "gold"
+version = "0.1.0"
+description = "Guided Online Learning for Distillation"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "torch",
+    "torchvision",
+    "scikit-image",
+    "tensorboardX",
+    "opencv-python",
+    "matplotlib",
+    "timm",
+    "nvitop",
+]

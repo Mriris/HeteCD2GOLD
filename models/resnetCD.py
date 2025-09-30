@@ -629,8 +629,8 @@ class cdsc(nn.Module):
         #     return [out_opt,out_sar]
 
 if __name__ == '__main__':
-    model = DualEUNet(3,3)
+    model = DualEUNet(n_channels=3, n_classes=2)
     x1 = torch.randn(1, 3, 256, 256)
     x2 = torch.randn(1, 3, 256, 256)
-    y = model(x1,x2)
-    print(y[0].shape)
+    y = model(x1, x2)
+    # print(y[0].shape)

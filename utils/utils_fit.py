@@ -288,9 +288,9 @@ def train(train_loader, train_loader_unchange, net, criterion, optimizer, schedu
                     train_loss_align_teacher.update(align_loss_teacher.item())
                     train_loss_feat_kd.update(feat_kd.item())
                     if loss_weights.get('attD_enable', True):
-                        train_loss_attD_map.update(float(attD_map))
-                        train_loss_attD_sp.update(float(attD_sp))
-                        train_loss_attD_ch.update(float(attD_ch))
+                        train_loss_attD_map.update(float(attD_map.detach()))
+                        train_loss_attD_sp.update(float(attD_sp.detach()))
+                        train_loss_attD_ch.update(float(attD_ch.detach()))
                     if args['dice']:
                         train_loss_dice.update(dice_loss_val)
 

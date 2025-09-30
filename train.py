@@ -68,8 +68,8 @@ args = {
     'load_path': os.path.join(working_path, 'checkpoints', DATA_NAME, 'pretrained.pth'),
     'use_multi_img_photometric': True,
     # 断点续训相关配置：仅当提供 resume_path 时启用
-    # 'resume_path': None,
-    'resume_path': r'/data/jingwei/yantingxuan/0Program/HeteCD2GOLD/checkpoints/Tgold/trios43/EXP20250929201335MSE+DA|MultiImgPhotoMetric',
+    'resume_path': None,
+    # 'resume_path': r'/data/jingwei/yantingxuan/0Program/HeteCD2GOLD/checkpoints/Tgold/trios43/EXP20250929201335MSE+DA|MultiImgPhotoMetric',
 }
 ###############################################
 
@@ -91,7 +91,7 @@ def main():
         print(f"已分配内存: {torch.cuda.memory_allocated(device) / (1024**3):.2f} GB")
         print(f"缓存内存: {torch.cuda.memory_reserved(device) / (1024**3):.2f} GB")
     
-    net = Net(3).cuda()
+    net = Net(input_nc=3, output_nc=2).cuda()
     # 保持输入为 channels_last，模型不整体转换，避免 rank 不一致错误
     net = nn.DataParallel(net)
 

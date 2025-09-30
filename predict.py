@@ -160,7 +160,7 @@ class PredOptions():
 def main():
     begin_time = time.time()
     opt = PredOptions().parse()
-    net = Net(3).cuda()
+    net = Net(input_nc=3, output_nc=2).cuda()
     checkpoint = torch.load(opt.chkpt_path, map_location='cuda:0')
     # 兼容两种格式：
     # 1) 仅 state_dict（原逻辑）

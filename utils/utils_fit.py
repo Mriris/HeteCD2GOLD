@@ -357,9 +357,11 @@ def train(train_loader, train_loader_unchange, net, criterion, optimizer, schedu
         score_train = cm2score(get_confuse_matrix(2, labels_all, preds_all))
 
         epoch_align_weight = (1.0 / (curr_epoch + 1)) * loss_weights['align_base_weight']
+        current_lr = optimizer.param_groups[0]['lr']
+        
         with open(os.path.join(args['log_dir'] + args['log_name']), 'a') as f:
-            f.write('Epoch: %d  Total time: %.1fs  Train loss %.4f  score %s\n' % (
-                curr_epoch, time.time() - begin_time, train_loss.average(), {k: score_train[k] for k in score_train}))
+            f.write('Epoch: %d  Total time: %.1fs  Train loss %.4f  LR: %.6f  score %s\n' % (
+                curr_epoch, time.time() - begin_time, train_loss.average(), current_lr, {k: score_train[k] for k in score_train}))
             f.write('  Detailed losses: CE=%.4f, Teacher=%.4f (CE=%.4f, Dice=%.4f), KD=%.4f, FeatKD=%.4f, AlignS=%.4f, AlignT=%.4f' % (
                 train_loss_ce.average(), train_loss_teacher.average(), train_loss_teacher_ce.average(), train_loss_teacher_dice.average(), train_loss_kd.average(),
                 train_loss_feat_kd.average(), train_loss_align_student.average(), train_loss_align_teacher.average()))
@@ -374,8 +376,8 @@ def train(train_loader, train_loader_unchange, net, criterion, optimizer, schedu
                 f.write(', Epoch_attD_weight=%.6f' % epoch_attD_weight)
             f.write('\n')
 
-        print('Epoch: %d  Total time: %.1fs  Train loss %.4f  score %s' % (
-            curr_epoch, time.time() - begin_time, train_loss.average(), {k: score_train[k] for k in score_train}))
+        print('Epoch: %d  Total time: %.1fs  Train loss %.4f  LR: %.6f  score %s' % (
+            curr_epoch, time.time() - begin_time, train_loss.average(), current_lr, {k: score_train[k] for k in score_train}))
         print('  Detailed losses: CE=%.4f, Teacher=%.4f (CE=%.4f, Dice=%.4f), KD=%.4f, FeatKD=%.4f, AlignS=%.4f, AlignT=%.4f' % (
             train_loss_ce.average(), train_loss_teacher.average(), train_loss_teacher_ce.average(), train_loss_teacher_dice.average(), train_loss_kd.average(),
             train_loss_feat_kd.average(), train_loss_align_student.average(), train_loss_align_teacher.average()), end='')

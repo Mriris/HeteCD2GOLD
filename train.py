@@ -41,9 +41,9 @@ def setup_seed(seed):
 # 设置随机数种子
 setup_seed(seed)
 # from models.SSCDl import SSCDl as Net
-NET_NAME = 'Tgold'
+NET_NAME = 'gold'
 DATA_NAME = 'trios43'
-EXP_NAME = "EXP"+time.strftime('%Y%m%d%H%M%S',time.localtime(time.time()))+"MSE+DA|MultiImgPhotoMetric"
+EXP_NAME = "EXP"+time.strftime('%Y%m%d%H%M%S',time.localtime(time.time()))+"MSE+DA|MultiImgPhotoMetric|PolyLR"
 ###############################################    
 #Training options
 ###############################################
@@ -57,8 +57,8 @@ args = {
     'lr': 0.0005,
     'epochs': 400,
     'gpu': True,
-    'lr_decay_power': 1.5,
-    'weight_decay': 1e-2,
+    'lr_decay_power': 1.0,
+    'weight_decay': 0.01,
     'momentum': 0.9,
     'print_freq': 5,
     'predict_step': 5,
@@ -227,21 +227,35 @@ def main():
     
     criterion = CrossEntropyLoss2d(ignore_index=0).cuda()
     try:
-        optimizer = optim.AdamW(filter(lambda p: p.requires_grad, net.parameters()), lr=args['lr'], betas=(0.9, 0.999), weight_decay=0.01, fused=True)
+        optimizer = optim.AdamW(filter(lambda p: p.requires_grad, net.parameters()), lr=args['lr'], betas=(0.9, 0.999), weight_decay=args['weight_decay'], fused=True)
     except TypeError:
-        optimizer = optim.AdamW(filter(lambda p: p.requires_grad, net.parameters()), lr=args['lr'], betas=(0.9, 0.999), weight_decay=0.01)
-    # 使用 OneCycleLR 提速早期收敛
+        optimizer = optim.AdamW(filter(lambda p: p.requires_grad, net.parameters()), lr=args['lr'], betas=(0.9, 0.999), weight_decay=args['weight_decay'])
+    
+    # 使用PolyLR（参考TinyCD）：先预热再多项式衰减，学习率曲线更平滑
     steps_per_epoch = max(1, len(train_loader_change))
-    scheduler = optim.lr_scheduler.OneCycleLR(
+    total_iters = args['epochs'] * steps_per_epoch
+    warmup_iters = max(steps_per_epoch, total_iters // 50)  # 约2%或至少1个epoch用于warmup
+    
+    # 预热阶段：线性增长到max_lr
+    warmup_scheduler = optim.lr_scheduler.LinearLR(
+        optimizer, 
+        start_factor=1e-6 / args['lr'],  # 从极小值开始
+        end_factor=1.0, 
+        total_iters=warmup_iters
+    )
+    
+    # 主训练阶段：多项式衰减到eta_min
+    main_scheduler = optim.lr_scheduler.PolynomialLR(
         optimizer,
-        max_lr=args['lr'],
-        epochs=args['epochs'],
-        steps_per_epoch=steps_per_epoch,
-        pct_start=0.1,
-        anneal_strategy='cos',
-        div_factor=25.0,
-        final_div_factor=1e4,
-        three_phase=False,
+        total_iters=total_iters - warmup_iters,
+        power=args['lr_decay_power'],  # 使用0.9
+    )
+    
+    # 组合调度器
+    scheduler = optim.lr_scheduler.SequentialLR(
+        optimizer,
+        schedulers=[warmup_scheduler, main_scheduler],
+        milestones=[warmup_iters]
     )
     args['use_onecycle'] = True
 

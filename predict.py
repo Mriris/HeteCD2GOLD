@@ -1,238 +1,400 @@
 import os
-import time
 import argparse
 import numpy as np
 import torch
-from skimage import io, exposure
-from torch.nn import functional as F
-from torchvision.transforms import functional as FF
-from torch.utils.data import DataLoader
-from datasets import RS_ST as RS
-from models.hetecd import hetecd as Net
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, Dataset
+from skimage import io
+from PIL import Image
+from tqdm import tqdm
 import cv2
-from scipy.spatial.distance import euclidean
-from scipy.stats import entropy, wasserstein_distance
-from scipy.special import rel_entr
-import seaborn as sns
-from utils.utils import accuracy, SCDD_eval_all, AverageMeter, get_confuse_matrix, cm2score
-DATA_NAME = 'ST'
-import torch
-import numpy as np
-import matplotlib.pyplot as plt
-from sklearn.decomposition import PCA
-from sklearn.preprocessing import StandardScaler
+import warnings
+from models.hetecd import hetecd as Net
+from utils.utils import get_confuse_matrix, cm2score
 
-# 输入：两个BCHW张量
-def visualize_features(tensor1, tensor2, output_filename, sample_size=10000):
+# 抑制 skimage 的低对比度图像警告
+warnings.filterwarnings('ignore', category=UserWarning, module='skimage')
+
+# 设备配置
+os.environ['CUDA_VISIBLE_DEVICES'] = '6'
+
+
+def normalize_state_dict(state_dict):
     """
-    可视化两组特征的直方图和KDE，并保存图像到指定文件。
-
-    参数:
-        tensor1 (torch.Tensor): 第一组特征，形状为 (B, C, H, W)。
-        tensor2 (torch.Tensor): 第二组特征，形状为 (B, C, H, W)。
-        output_filename (str): 图像保存的文件名（包含路径）。
-        sample_size (int): 随机采样的大小，默认10000。
+    规范化权重键名，自动剥离 DataParallel 和 torch.compile 添加的前缀
+    
+    Args:
+        state_dict: 原始权重字典
+        
+    Returns:
+        规范化后的权重字典
     """
-    # 将特征展平成 1D 数组
-    flattened_features1 = tensor1.flatten().cpu().numpy()
-    flattened_features2 = tensor2.flatten().cpu().numpy()
-
-    # 随机采样来加快计算
-    sampled_features1 = np.random.choice(flattened_features1, size=sample_size, replace=False)
-    sampled_features2 = np.random.choice(flattened_features2, size=sample_size, replace=False)
-
-    # 创建一个2x2的绘图窗口
-    fig, axs = plt.subplots(2, 2, figsize=(12, 10))
-
-    # 绘制 tensor1 的直方图
-    sns.histplot(sampled_features1, bins=50, color='blue', ax=axs[0, 0])
-    axs[0, 0].set_title('Histogram of Features1')
-    axs[0, 0].set_xlabel('Feature Values')
-    axs[0, 0].set_ylabel('Count')
-
-    # 绘制 tensor2 的直方图
-    sns.histplot(sampled_features2, bins=50, color='red', ax=axs[0, 1])
-    axs[0, 1].set_title('Histogram of Features2')
-    axs[0, 1].set_xlabel('Feature Values')
-    axs[0, 1].set_ylabel('Count')
-
-    # 绘制 tensor1 的 KDE
-    sns.kdeplot(sampled_features1, color='blue', ax=axs[1, 0])
-    axs[1, 0].set_title('KDE of Features1')
-    axs[1, 0].set_xlabel('Feature Values')
-    axs[1, 0].set_ylabel('Density')
-
-    # 绘制 tensor2 的 KDE
-    sns.kdeplot(sampled_features2, color='red', ax=axs[1, 1])
-    axs[1, 1].set_title('KDE of Features2')
-    axs[1, 1].set_xlabel('Feature Values')
-    axs[1, 1].set_ylabel('Density')
-
-    # 调整图像布局
-    plt.tight_layout()
-
-    # 保存图像到文件
-    plt.savefig(output_filename)
-    plt.close()
-
-# # 示例：创建两个随机的BCHW张量
-# tensor1 = torch.rand(4, 64, 128, 128)
-# tensor2 = torch.rand(4, 64, 128, 128)
-
-# # 调用函数对比特征分布
+    new_state_dict = {}
+    
+    for key, value in state_dict.items():
+        # 移除可能的前缀组合
+        new_key = key
+        
+        # 处理各种可能的前缀
+        prefixes_to_remove = [
+            '_orig_mod.module.',  # torch.compile + DataParallel
+            'module._orig_mod.',  # 另一种可能的顺序
+            '_orig_mod.',         # 仅 torch.compile
+            'module.',            # 仅 DataParallel
+        ]
+        
+        for prefix in prefixes_to_remove:
+            if new_key.startswith(prefix):
+                new_key = new_key[len(prefix):]
+                break
+        
+        new_state_dict[new_key] = value
+    
+    return new_state_dict
 
 
-def compute_feature_distances(tensor1, tensor2):
-    # 检查输入的形状是否相同
-    if tensor1.shape != tensor2.shape:
-        raise ValueError("输入的两个tensor形状必须相同")
+class TestDataset(Dataset):
+    """
+    测试数据集类，支持 test/A 和 test/B 格式
+    可选地读取 test/label 用于评估
+    """
+    def __init__(self, test_dir, has_label=True):
+        self.test_dir = test_dir
+        self.has_label = has_label
+        
+        # 读取图像路径
+        img_A_dir = os.path.join(test_dir, 'A')
+        img_B_dir = os.path.join(test_dir, 'B')
+        
+        if not os.path.exists(img_A_dir) or not os.path.exists(img_B_dir):
+            raise ValueError(f"数据集目录不存在: {img_A_dir} 或 {img_B_dir}")
+        
+        self.img_names = sorted([f for f in os.listdir(img_A_dir) if f.endswith(('.png', '.tif', '.jpg'))])
+        
+        # 如果有标签，检查标签目录
+        if has_label:
+            label_dir = os.path.join(test_dir, 'label')
+            if not os.path.exists(label_dir):
+                print(f"警告: 标签目录不存在 {label_dir}，将不计算指标")
+                self.has_label = False
+        
+        print(f"加载了 {len(self.img_names)} 个测试样本")
+    
+    def __len__(self):
+        return len(self.img_names)
+    
+    def __getitem__(self, idx):
+        img_name = self.img_names[idx]
+        
+        # 读取图像
+        img_A_path = os.path.join(self.test_dir, 'A', img_name)
+        img_B_path = os.path.join(self.test_dir, 'B', img_name)
+        
+        img_A = io.imread(img_A_path)
+        img_B = io.imread(img_B_path)
+        
+        # 转换为张量并归一化到 [0, 1]
+        img_A = torch.from_numpy(img_A).permute(2, 0, 1).float() / 255.0
+        img_B = torch.from_numpy(img_B).permute(2, 0, 1).float() / 255.0
+        
+        # 读取标签（如果存在）
+        label = None
+        if self.has_label:
+            label_path = os.path.join(self.test_dir, 'label', img_name)
+            if os.path.exists(label_path):
+                label = io.imread(label_path)
+                # 二值化标签
+                label = (label > 127).astype(np.uint8)
+            else:
+                self.has_label = False
+        
+        return img_A, img_B, img_B, label, img_name  # img_C 用 img_B 代替
 
-    # 将tensor展平为 [B, C * H * W] 的形状
-    B = tensor1.size(0)  # batch size
-    tensor1_flat = tensor1.view(B, -1).cpu().numpy()
-    tensor2_flat = tensor2.view(B, -1).cpu().numpy()
 
-    # 1. 欧氏距离 (Euclidean Distance)
-    euclidean_distances = np.array([euclidean(t1, t2) for t1, t2 in zip(tensor1_flat, tensor2_flat)])
-    euclidean_mean = np.mean(euclidean_distances)
+def load_model(checkpoint_path, device='cuda'):
+    """
+    加载模型权重，自动处理键名不匹配问题
+    
+    Args:
+        checkpoint_path: 权重文件路径
+        device: 运行设备
+        
+    Returns:
+        加载好权重的模型
+    """
+    # 创建模型
+    model = Net(input_nc=3, output_nc=2).to(device)
+    
+    # 加载权重
+    print(f"加载权重: {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location=device)
+    
+    # 提取状态字典
+    if isinstance(checkpoint, dict) and 'model_state' in checkpoint:
+        state_dict = checkpoint['model_state']
+        epoch_info = checkpoint.get('epoch', 'unknown')
+        print(f"加载的权重来自 epoch: {epoch_info}")
+    else:
+        state_dict = checkpoint
+    
+    # 规范化键名
+    state_dict = normalize_state_dict(state_dict)
+    
+    # 加载权重
+    missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+    
+    # 报告加载情况
+    if len(missing_keys) == 0 and len(unexpected_keys) == 0:
+        print("✓ 权重完整加载成功")
+    else:
+        if len(missing_keys) > 0:
+            print(f"⚠ 缺失的键 ({len(missing_keys)}): {missing_keys[:5]}...")
+        if len(unexpected_keys) > 0:
+            print(f"⚠ 多余的键 ({len(unexpected_keys)}): {unexpected_keys[:5]}...")
+    
+    model.eval()
+    return model
 
-    # 2. KL散度 (Kullback-Leibler Divergence)
-    tensor1_prob = torch.nn.functional.softmax(torch.tensor(tensor1_flat), dim=-1).numpy()
-    tensor2_prob = torch.nn.functional.softmax(torch.tensor(tensor2_flat), dim=-1).numpy()
 
-    kl_divergence = np.array([np.sum(rel_entr(t1, t2)) for t1, t2 in zip(tensor1_prob, tensor2_prob)])
-    kl_mean = np.mean(kl_divergence)
+def create_error_visualization(pred, label):
+    """
+    创建误差可视化图像
+    
+    Args:
+        pred: 预测结果 (H, W)，值为 0 或 1
+        label: 真值标签 (H, W)，值为 0 或 1
+        
+    Returns:
+        可视化图像 (H, W, 3)，BGR格式
+        - 白色: 正确预测
+        - 红色: 假阳性 (预测为1，实际为0)
+        - 绿色: 假阴性 (预测为0，实际为1)
+        - 黑色: 正确的背景
+    """
+    h, w = pred.shape
+    vis = np.zeros((h, w, 3), dtype=np.uint8)
+    
+    # 正确的变化区域 (白色)
+    correct_change = (pred == 1) & (label == 1)
+    vis[correct_change] = [255, 255, 255]
+    
+    # 假阳性 (红色) - 预测为变化但实际未变化
+    false_positive = (pred == 1) & (label == 0)
+    vis[false_positive] = [0, 0, 255]  # BGR: 红色
+    
+    # 假阴性 (绿色) - 预测为未变化但实际变化
+    false_negative = (pred == 0) & (label == 1)
+    vis[false_negative] = [0, 255, 0]  # BGR: 绿色
+    
+    # 正确的背景保持黑色
+    
+    return vis
 
-    # 3. JS散度 (Jensen-Shannon Divergence)
-    def jensen_shannon_divergence(p, q):
-        m = 0.5 * (p + q)
-        return 0.5 * (entropy(p, m) + entropy(q, m))
 
-    js_divergence = np.array([jensen_shannon_divergence(t1, t2) for t1, t2 in zip(tensor1_prob, tensor2_prob)])
-    js_mean = np.mean(js_divergence)
+def predict(model, test_loader, save_dir, device='cuda', save_vis=True):
+    """
+    执行预测并保存结果
+    
+    Args:
+        model: 训练好的模型
+        test_loader: 测试数据加载器
+        save_dir: 保存目录
+        device: 运行设备
+        save_vis: 是否保存可视化结果
+        
+    Returns:
+        预测结果和标签（用于计算指标）
+    """
+    model.eval()
+    
+    # 创建保存目录 - 直接使用输出目录，不创建子文件夹
+    os.makedirs(save_dir, exist_ok=True)
+    
+    all_preds = []
+    all_labels = []
+    has_label = False
+    
+    with torch.no_grad():
+        for img_A, img_B, img_C, label, names in tqdm(test_loader, desc="预测中"):
+            # 移到设备
+            img_A = img_A.to(device)
+            img_B = img_B.to(device)
+            img_C = img_C.to(device)
+            
+            # 前向传播
+            output = model(img_A, img_B, img_C)
+            
+            # 获取预测结果
+            if isinstance(output, (list, tuple)):
+                output = output[0]  # 取第一个输出
+            
+            # 转换为概率
+            pred_prob = F.softmax(output, dim=1)
+            # 取变化类别的概率
+            pred = pred_prob[:, 1, :, :].cpu().numpy()
+            # 二值化
+            pred_binary = (pred > 0.5).astype(np.uint8)
+            
+            # 保存每个样本
+            for i in range(pred_binary.shape[0]):
+                name = names[i] if isinstance(names, (list, tuple)) else names
+                pred_img = pred_binary[i] * 255
+                
+                # 如果有标签，创建可视化
+                if label is not None and label[i] is not None:
+                    has_label = True
+                    label_np = label[i].cpu().numpy() if torch.is_tensor(label[i]) else label[i]
+                    all_preds.append(pred_binary[i])
+                    all_labels.append(label_np)
+                    
+                    if save_vis:
+                        # 保存真值
+                        label_img = label_np * 255
+                        label_path = os.path.join(save_dir, f"{os.path.splitext(name)[0]}_label.png")
+                        io.imsave(label_path, label_img.astype(np.uint8))
+                        
+                        # 保存预测值
+                        pred_vis_path = os.path.join(save_dir, f"{os.path.splitext(name)[0]}_pred.png")
+                        io.imsave(pred_vis_path, pred_img.astype(np.uint8))
+                        
+                        # 保存误差可视化
+                        error_vis = create_error_visualization(pred_binary[i], label_np)
+                        error_path = os.path.join(save_dir, f"{os.path.splitext(name)[0]}_error.png")
+                        cv2.imwrite(error_path, error_vis)
+                else:
+                    # 没有标签时，只保存预测二值图
+                    all_preds.append(pred_binary[i])
+                    if save_vis:
+                        pred_path = os.path.join(save_dir, f"{os.path.splitext(name)[0]}_pred.png")
+                        io.imsave(pred_path, pred_img.astype(np.uint8))
+    
+    print(f"\n预测完成！结果保存至: {save_dir}")
+    if has_label:
+        print(f"生成了 {len(all_preds)} 组可视化结果（label、pred、error）")
+    
+    return all_preds, all_labels if has_label else None
 
-    # 4. Wasserstein 距离 (Wasserstein Distance)
-    wasserstein_distances = np.array([wasserstein_distance(t1, t2) for t1, t2 in zip(tensor1_flat, tensor2_flat)])
-    wasserstein_mean = np.mean(wasserstein_distances)
 
-    # 5. Hellinger 距离 (Hellinger Distance)
-    def hellinger_distance(p, q):
-        return np.sqrt(0.5 * np.sum((np.sqrt(p) - np.sqrt(q)) ** 2))
-
-    hellinger_distances = np.array([hellinger_distance(t1, t2) for t1, t2 in zip(tensor1_prob, tensor2_prob)])
-    hellinger_mean = np.mean(hellinger_distances)
-
-    # 返回结果
-    results = {
-        "Euclidean Distance": euclidean_mean,
-        "KL Divergence": kl_mean,
-        "JS Divergence": js_mean,
-        "Wasserstein Distance": wasserstein_mean,
-        "Hellinger Distance": hellinger_mean
-    }
-
-    return results
-class PredOptions():
-    def __init__(self):
-        self.initialized = False
-
-    def initialize(self, parser):
-        working_path = os.path.dirname(os.path.abspath(__file__))
-        parser.add_argument('--pred_batch_size', type=int, default=1, help='prediction batch size')
-        parser.add_argument('--test_dir', type=str, default='/data/jingwei/HeteCD/data/xiongan_data_old/test/', help='directory to test images')
-        parser.add_argument('--pred_dir', type=str, default='/data/jingwei/HeteCD/res', help='directory to output masks')
-        parser.add_argument('--chkpt_path', type=str, default='checkpoints/cdsc_2b_3D_decoder_atten/xiongan/aloss+klloss+data_argu20240703130032/cdsc_2b_3D_decoder_atten_113IoU67.59', help='path to checkpoint')
-        self.initialized = True
-        return parser
-
-    def gather_options(self):
-        if not self.initialized:
-            parser = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-            parser = self.initialize(parser)
-        self.parser = parser
-        return parser.parse_args()
-
-    def parse(self):
-        self.opt = self.gather_options()
-        return self.opt
+def calculate_metrics(preds, labels, num_classes=2):
+    """
+    计算评估指标
+    
+    Args:
+        preds: 预测结果列表
+        labels: 真值标签列表
+        num_classes: 类别数
+        
+    Returns:
+        指标字典
+    """
+    if labels is None or len(labels) == 0:
+        print("没有标签，跳过指标计算")
+        return None
+    
+    # 计算混淆矩阵
+    confusion_matrix = get_confuse_matrix(num_classes, labels, preds)
+    
+    # 计算各项指标
+    scores = cm2score(confusion_matrix)
+    
+    return scores
 
 
 def main():
-    begin_time = time.time()
-    opt = PredOptions().parse()
-    net = Net(input_nc=3, output_nc=2).cuda()
-    checkpoint = torch.load(opt.chkpt_path, map_location='cuda:0')
-    # 兼容两种格式：
-    # 1) 仅 state_dict（原逻辑）
-    # 2) 封装字典，包含 'model_state'
-    if isinstance(checkpoint, dict) and 'model_state' in checkpoint:
-        state_dict_in = checkpoint['model_state']
-    else:
-        state_dict_in = checkpoint
-    # 去除可能的 DataParallel 前缀
-    new_state_dict = {k[7:] if k.startswith('module.') else k: v for k, v in state_dict_in.items()}
-    net.load_state_dict(new_state_dict, strict=False)
-
-    net.eval()
-
-
-
-    predict(net, opt.test_dir, opt.pred_dir)
-    time_use = time.time() - begin_time
-    print('Total time: %.2fs' % time_use)
-
-
-def load_images_from_folder(folder):
-    images_A = []
-    images_B = []
-    labels = []
-    filenames = sorted(os.listdir(os.path.join(folder, 'A')))
-    for filename in filenames:
-        img_A = io.imread(os.path.join(folder, 'A', filename))
-        img_B = io.imread(os.path.join(folder, 'B', filename))
-        label = io.imread(os.path.join(folder, 'label', filename))
-        if img_A is not None and img_B is not None:
-            images_A.append(img_A)
-            images_B.append(img_B)
-            labels.append(label)
-    return images_A, images_B, labels, filenames
-
-
-def predict(net, test_dir, pred_dir):
-    images_A, images_B, labels, filenames = load_images_from_folder(test_dir)
-    preds_all = []
-    labels_all = []
-    i = 0
-    for img_A, img_B, label, filename in zip(images_A, images_B, labels, filenames):
-        img_A = FF.to_tensor(img_A).cuda().float().unsqueeze(0)
-        img_B = FF.to_tensor(img_B).cuda().float().unsqueeze(0)
+    parser = argparse.ArgumentParser(description='变化检测预测脚本')
+    parser.add_argument('--checkpoint', type=str, 
+                        default=r'/data/jingwei/yantingxuan/0Program/HeteCD2GOLD/checkpoints/gold/trios43/EXP20250930205453MSE+DA|MultiImgPhotoMetric|PolyLR/best_checkpoint.pth',
+                        help='权重文件路径')
+    parser.add_argument('--test_dir', type=str, 
+                        default=r'/data/jingwei/yantingxuan/Datasets/CityCN/Split43/test',
+                        help='测试数据目录（包含 A、B 子目录）')
+    parser.add_argument('--output_dir', type=str, 
+                        default='/data/jingwei/yantingxuan/0Program/HeteCD2GOLD/results',
+                        help='结果保存目录')
+    parser.add_argument('--batch_size', type=int, default=4, help='批次大小')
+    parser.add_argument('--no_vis', action='store_true', help='不保存可视化结果')
+    parser.add_argument('--device', type=str, default='cuda', help='运行设备')
+    
+    args = parser.parse_args()
+    
+    # 设置设备
+    device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
+    print(f"使用设备: {device}")
+    
+    # 加载模型
+    model = load_model(args.checkpoint, device)
+    
+    # 创建数据集
+    test_dataset = TestDataset(args.test_dir, has_label=True)
+    test_loader = DataLoader(
+        test_dataset,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=4,
+        pin_memory=True
+    )
+    
+    # 执行预测
+    preds, labels = predict(
+        model, 
+        test_loader, 
+        args.output_dir, 
+        device, 
+        save_vis=not args.no_vis
+    )
+    
+    # 计算指标
+    if labels is not None:
+        print("\n" + "="*50)
+        print("评估指标:")
+        print("="*50)
         
-        with torch.inference_mode():
-            # for i in range(100):
-            #     t1 = time.time()
-            #     out_change, features = net(img_A, img_B)
-            out_change, features = net(img_A, img_B)
+        metrics = calculate_metrics(preds, labels)
+        
+        if metrics:
+            # 打印主要指标
+            print(f"整体准确率 (Accuracy): {metrics['acc']*100:.2f}%")
+            print(f"平均IoU (mIoU): {metrics['miou']*100:.2f}%")
+            print(f"平均F1分数 (mF1): {metrics['mf1']*100:.2f}%")
             
-            preds = torch.argmax(out_change, dim=1)
-            pred_numpy = preds[0].cpu().numpy().astype(np.uint8)
-            # pred_numpy = preds.cpu().numpy()
-            labels_numpy = label[np.newaxis, ...]
-            print(i)
-            i+=1
-            #print(np.unique(labels_numpy))
-            preds_all.append(pred_numpy[np.newaxis, ...])
-            labels_all.append(labels_numpy)
-        if not os.path.exists(pred_dir):
-            os.makedirs(pred_dir)
-        save_path = os.path.join(pred_dir, filename)
-        cv2.imwrite(save_path, pred_numpy * 255)
+            # 打印类别IoU
+            print(f"\n类别IoU:")
+            print(f"  背景 (IoU_0): {metrics['iou_0']*100:.2f}%")
+            print(f"  变化 (IoU_1): {metrics['iou_1']*100:.2f}%")
+            
+            # 打印类别F1
+            print(f"\n类别F1:")
+            print(f"  背景 (F1_0): {metrics['F1_0']*100:.2f}%")
+            print(f"  变化 (F1_1): {metrics['F1_1']*100:.2f}%")
+            
+            # 打印精确率和召回率
+            print(f"\n精确率和召回率:")
+            print(f"  变化类精确率: {metrics['precision_1']*100:.2f}%")
+            print(f"  变化类召回率: {metrics['recall_1']*100:.2f}%")
+            
+            # 保存指标到文件
+            metrics_path = os.path.join(args.output_dir, 'metrics.txt')
+            with open(metrics_path, 'w', encoding='utf-8') as f:
+                f.write("="*50 + "\n")
+                f.write("评估指标\n")
+                f.write("="*50 + "\n\n")
+                f.write(f"整体准确率 (Accuracy): {metrics['acc']*100:.2f}%\n")
+                f.write(f"平均IoU (mIoU): {metrics['miou']*100:.2f}%\n")
+                f.write(f"平均F1分数 (mF1): {metrics['mf1']*100:.2f}%\n\n")
+                f.write(f"类别IoU:\n")
+                f.write(f"  背景 (IoU_0): {metrics['iou_0']*100:.2f}%\n")
+                f.write(f"  变化 (IoU_1): {metrics['iou_1']*100:.2f}%\n\n")
+                f.write(f"类别F1:\n")
+                f.write(f"  背景 (F1_0): {metrics['F1_0']*100:.2f}%\n")
+                f.write(f"  变化 (F1_1): {metrics['F1_1']*100:.2f}%\n\n")
+                f.write(f"精确率和召回率:\n")
+                f.write(f"  变化类精确率: {metrics['precision_1']*100:.2f}%\n")
+                f.write(f"  变化类召回率: {metrics['recall_1']*100:.2f}%\n")
+            
+            print(f"\n指标已保存至: {metrics_path}")
     
-    preds_all = np.concatenate(preds_all, axis=0)
-    labels_all = np.concatenate(labels_all, axis=0)//255
+    print("\n预测完成！")
 
-    
-    hist = get_confuse_matrix(2,labels_all,preds_all)
-    score = cm2score(hist)
-    print(score)
+
 if __name__ == '__main__':
     main()

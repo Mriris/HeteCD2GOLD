@@ -8,4 +8,4 @@ open-cd/
 *.log*
 .triton_cache/
 .extra_libs/
-/results
+/results*

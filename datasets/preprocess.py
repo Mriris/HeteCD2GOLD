@@ -25,7 +25,7 @@ import math
 
 # 默认参数
 DEFAULT_INPUT_DIR = r"/data/jingwei/yantingxuan/Datasets/CityCN/Final"
-DEFAULT_OUTPUT_DIR = r"/data/jingwei/yantingxuan/Datasets/CityCN/Split43"
+DEFAULT_OUTPUT_DIR = r"/data/jingwei/yantingxuan/Datasets/CityCN/Split45"
 DEFAULT_TILE_SIZE = 512
 DEFAULT_VAL_RATIO = 0.2 # 验证集比例
 DEFAULT_BLACK_THRESHOLD = 0.95
@@ -447,43 +447,28 @@ class MetadataProcessor:
                         continue
                     (src_x1, src_y1, src_x2, src_y2), (dst_x1, dst_y1, dst_x2, dst_y2) = windows
                     
-                    # 读取标签文件并按地理坐标重采样到目标窗口
+                    # 读取标签文件（与 A 同像素网格），直接用像素窗口裁剪并对齐到目标窗口
                     label_path = img_meta.files['label']
                     with Image.open(label_path).convert('L') as img:
                         img_array = np.array(img)
                     if img_array.size == 0:
                         continue
-                    
-                    # 源窗口与其仿射
-                    from rasterio.windows import Window, transform as win_transform
-                    window = Window(src_x1, src_y1, src_x2 - src_x1, src_y2 - src_y1)
-                    src_transform_win = win_transform(window, img_meta.transform)
+
                     src_region = img_array[src_y1:src_y2, src_x1:src_x2]
-                    
-                    # 目标窗口大小与仿射（对齐到 tile 网格中子窗口位置）
+
+                    # 目标窗口大小
                     dst_h = dst_y2 - dst_y1
                     dst_w = dst_x2 - dst_x1
                     if dst_h <= 0 or dst_w <= 0 or src_region.size == 0:
                         continue
-                    tile_min_x, tile_min_y, tile_max_x, tile_max_y = tile_meta.global_bounds
-                    tile_transform = Affine(self.target_resolution, 0, tile_min_x, 0, -self.target_resolution, tile_max_y)
-                    dst_transform_win = tile_transform * Affine.translation(dst_x1, dst_y1)
-                    
-                    # 执行重投影（最近邻）
-                    dst_region = np.zeros((dst_h, dst_w), dtype=np.uint8)
-                    reproject(
-                        source=src_region,
-                        destination=dst_region,
-                        src_transform=src_transform_win,
-                        src_crs=img_meta.crs,
-                        dst_transform=dst_transform_win,
-                        dst_crs=self.target_crs,
-                        resampling=Resampling.nearest
-                    )
-                    
+
+                    # 最近邻缩放到目标窗口
+                    if src_region.shape[:2] != (dst_h, dst_w):
+                        src_region = np.array(Image.fromarray(src_region).resize((dst_w, dst_h), Image.NEAREST))
+
                     # 合并到标签tile（最大值并集）
                     label_tile[dst_y1:dst_y2, dst_x1:dst_x2] = np.maximum(
-                        label_tile[dst_y1:dst_y2, dst_x1:dst_x2], dst_region
+                        label_tile[dst_y1:dst_y2, dst_x1:dst_x2], src_region
                     )
                 
                 # 计算前景比例
@@ -1308,10 +1293,12 @@ class TileGenerator:
                         continue
                     
                     if img_type == 'label':
-                        # PNG标签文件
+                        # PNG标签文件（像素与 A 同尺寸，同一像素网格）。
+                        # 直接使用源窗口像素裁剪并缩放到目标子窗口大小；
+                        # 同时用 A/B 的有效覆盖掩膜约束标签，避免标签落在无数据区域。
                         with Image.open(file_path).convert('L') as img:
                             img_array = np.array(img)
-                        
+
                         src_region = img_array[src_y1:src_y2, src_x1:src_x2]
                         if src_region.size == 0:
                             continue
@@ -1319,7 +1306,21 @@ class TileGenerator:
                             img_pil = Image.fromarray(src_region)
                             img_pil = img_pil.resize((dst_w, dst_h), Image.NEAREST)
                             src_region = np.array(img_pil)
-                        
+
+                        # 计算 A/B 的有效覆盖掩膜（>0 视为有效像素）
+                        a_sub = tile_data['A'][dst_y1:dst_y2, dst_x1:dst_x2]
+                        b_sub = tile_data['B'][dst_y1:dst_y2, dst_x1:dst_x2]
+                        a_valid = np.any(a_sub > 0, axis=-1)
+                        b_valid = np.any(b_sub > 0, axis=-1)
+                        coverage_mask = a_valid & b_valid
+
+                        # 将无覆盖区域的标签置零，避免视觉错位
+                        if coverage_mask.shape == src_region.shape:
+                            src_region = np.where(coverage_mask, src_region, 0)
+                        else:
+                            # 理论上尺寸应一致；若不一致则保守不作掩膜
+                            pass
+
                         # 使用最大值合并（标签）
                         dst_region = tile_data[img_type][dst_y1:dst_y2, dst_x1:dst_x2]
                         tile_data[img_type][dst_y1:dst_y2, dst_x1:dst_x2] = np.maximum(dst_region, src_region)

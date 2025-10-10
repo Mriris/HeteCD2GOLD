@@ -1,7 +1,9 @@
 import os
 import time
 import random
+import socket
 import numpy as np
+import shlex
 import torch.nn as nn
 import torch.autograd
 from skimage import io
@@ -42,7 +44,7 @@ def setup_seed(seed):
 setup_seed(seed)
 # from models.SSCDl import SSCDl as Net
 NET_NAME = 'gold'
-DATA_NAME = 'trios43'
+DATA_NAME = 'trios45'
 EXP_NAME = "EXP"+time.strftime('%Y%m%d%H%M%S',time.localtime(time.time()))+"MSE+DA|MultiImgPhotoMetric|PolyLR"
 ###############################################    
 #Training options
@@ -73,9 +75,29 @@ args = {
 }
 ###############################################
 
-# writer = SummaryWriter(args['log_dir'])
 #日期时间作为日志文件名
 args['log_name']="/log.txt"
+
+def find_free_port(start_port=6006, max_attempts=100):
+    """
+    查找可用端口
+    
+    Args:
+        start_port: 起始端口（默认6006是TensorBoard默认端口）
+        max_attempts: 最大尝试次数
+        
+    Returns:
+        可用端口号
+    """
+    for port in range(start_port, start_port + max_attempts):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.bind(('', port))
+                return port
+        except OSError:
+            continue
+    raise RuntimeError(f"在端口 {start_port}-{start_port+max_attempts} 范围内未找到可用端口")
+
 def main():        
     # 清空GPU缓存
     torch.cuda.empty_cache()
@@ -269,7 +291,43 @@ def main():
         except Exception as e:
             print(f"优化器/调度器状态恢复失败：{e}")
 
+    # 初始化 TensorBoard 日志并查找可用端口
+    writer = SummaryWriter(log_dir=args['log_dir'])
+    args['tb_writer'] = writer
+    
+    # 查找可用端口并记录到日志
+    try:
+        tb_port = find_free_port()
+        # 使用 shlex.quote 确保包含特殊字符（如 |）的路径被正确转义
+        tb_logdir_safe = shlex.quote(args['log_dir'])
+        tb_command = f"tensorboard --logdir {tb_logdir_safe} --port {tb_port}"
+        tb_url = f"http://localhost:{tb_port}"
+        
+        # 写入日志文件
+        with open(os.path.join(args['log_dir'] + args['log_name']), 'a') as f:
+            f.write('=' * 80 + '\n')
+            f.write('TensorBoard 可视化信息:\n')
+            f.write(f'  可用端口: {tb_port}\n')
+            f.write(f'  启动命令: {tb_command}\n')
+            f.write(f'  访问地址: {tb_url}\n')
+            f.write('=' * 80 + '\n\n')
+        
+        # 同时打印到控制台
+        print('=' * 80)
+        print('TensorBoard 可视化信息:')
+        print(f'  可用端口: {tb_port}')
+        print(f'  启动命令: {tb_command}')
+        print(f'  访问地址: {tb_url}')
+        print('=' * 80 + '\n')
+    except Exception as e:
+        print(f"TensorBoard 端口查找失败: {e}，可手动指定端口启动")
+
     train(train_loader_change, train_loader_unchange,net, criterion, optimizer, scheduler, val_loader, args)
+    # 关闭 TensorBoard
+    try:
+        writer.close()
+    except Exception:
+        pass
     print('Training finished.')
 
         

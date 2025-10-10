@@ -3,3 +3,5 @@ tensorboardX
 opencv-python
 matplotlib
 timm
+rasterio
+tensorboard

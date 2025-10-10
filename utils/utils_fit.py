@@ -157,6 +157,9 @@ def train(train_loader, train_loader_unchange, net, criterion, optimizer, schedu
         except Exception:
             pass
 
+    # 可选的 TensorBoard writer
+    writer = args.get('tb_writer', None)
+
     while True:
         net.train()
         start = time.time()
@@ -389,6 +392,29 @@ def train(train_loader, train_loader_unchange, net, criterion, optimizer, schedu
         print(', Epoch_align_weight=%.4f, Epoch_teacher_weight=%.6f, Epoch_kd_weight=%.6f' % (
             epoch_align_weight, teacher_lambda, kd_lambda))
 
+        # TensorBoard 记录训练阶段标量
+        if writer is not None:
+            try:
+                writer.add_scalar('Train/Loss_total', train_loss.average(), curr_epoch)
+                writer.add_scalar('Train/Loss_CE', train_loss_ce.average(), curr_epoch)
+                writer.add_scalar('Train/Loss_Dice', train_loss_dice.average() if args['dice'] else 0.0, curr_epoch)
+                writer.add_scalar('Train/Loss_Teacher_total', train_loss_teacher.average(), curr_epoch)
+                writer.add_scalar('Train/Loss_Teacher_CE', train_loss_teacher_ce.average(), curr_epoch)
+                writer.add_scalar('Train/Loss_KD', train_loss_kd.average(), curr_epoch)
+                writer.add_scalar('Train/Loss_FeatKD', train_loss_feat_kd.average(), curr_epoch)
+                writer.add_scalar('Train/Align_student', train_loss_align_student.average(), curr_epoch)
+                writer.add_scalar('Train/Align_teacher', train_loss_align_teacher.average(), curr_epoch)
+                if args['loss_weights'].get('attD_enable', True):
+                    writer.add_scalar('Train/AttD_map', train_loss_attD_map.average(), curr_epoch)
+                    writer.add_scalar('Train/AttD_sp', train_loss_attD_sp.average(), curr_epoch)
+                    writer.add_scalar('Train/AttD_ch', train_loss_attD_ch.average(), curr_epoch)
+                writer.add_scalar('Train/LR', current_lr, curr_epoch)
+                writer.add_scalar('Train/IoU_1', score_train.get('iou_1', 0.0), curr_epoch)
+                writer.add_scalar('Train/mIoU', score_train.get('miou', 0.0), curr_epoch)
+                writer.add_scalar('Train/mF1', score_train.get('mf1', 0.0), curr_epoch)
+            except Exception:
+                pass
+
         if score_train['iou_1'] > bestiouT:
             bestiouT = score_train['iou_1']
             for pred, label, name in zip(preds_all, labels_all, names_all):
@@ -432,6 +458,17 @@ def train(train_loader, train_loader_unchange, net, criterion, optimizer, schedu
                 curr_epoch, time.time() - begin_time, bestiou * 100, bestloss))
         print('Epoch: %d  Total time: %.1fs  Val iou %.2f  loss %.4f' % (
             curr_epoch, time.time() - begin_time, bestiou * 100, bestloss))
+
+        # TensorBoard 记录验证阶段标量
+        if writer is not None:
+            try:
+                writer.add_scalar('Val/Loss', loss_val, curr_epoch)
+                writer.add_scalar('Val/IoU_1', score_val.get('iou_1', 0.0), curr_epoch)
+                writer.add_scalar('Val/mIoU', score_val.get('miou', 0.0), curr_epoch)
+                writer.add_scalar('Val/mF1', score_val.get('mf1', 0.0), curr_epoch)
+                writer.add_scalar('Val/Best_IoU_1', bestiou, curr_epoch)
+            except Exception:
+                pass
 
         curr_epoch += 1
         if curr_epoch >= args['epochs']:

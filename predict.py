@@ -106,7 +106,8 @@ class TestDataset(Dataset):
                 # 二值化标签
                 label = (label > 127).astype(np.uint8)
             else:
-                self.has_label = False
+                # 单个样本缺失标签则返回 None，不影响其他样本
+                label = None
         
         return img_A, img_B, img_B, label, img_name  # img_C 用 img_B 代替
 
@@ -306,10 +307,10 @@ def main():
                         default=r'/data/jingwei/yantingxuan/0Program/HeteCD2GOLD/checkpoints/gold/trios43/EXP20250930205453MSE+DA|MultiImgPhotoMetric|PolyLR/best_checkpoint.pth',
                         help='权重文件路径')
     parser.add_argument('--test_dir', type=str, 
-                        default=r'/data/jingwei/yantingxuan/Datasets/CityCN/Split43/test',
+                        default=r'/data/jingwei/yantingxuan/Datasets/CityCN/Split43/test2',
                         help='测试数据目录（包含 A、B 子目录）')
     parser.add_argument('--output_dir', type=str, 
-                        default='/data/jingwei/yantingxuan/0Program/HeteCD2GOLD/results',
+                        default='/data/jingwei/yantingxuan/0Program/HeteCD2GOLD/results2',
                         help='结果保存目录')
     parser.add_argument('--batch_size', type=int, default=4, help='批次大小')
     parser.add_argument('--no_vis', action='store_true', help='不保存可视化结果')

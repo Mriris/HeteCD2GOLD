@@ -13,5 +13,6 @@ dependencies = [
     "matplotlib",
     "timm",
     "nvitop",
-    "rasterio>=1.4.3",
+    "rasterio",
+    "tensorboard",
 ]

@@ -16,7 +16,7 @@ from utils.utils import get_confuse_matrix, cm2score
 warnings.filterwarnings('ignore', category=UserWarning, module='skimage')
 
 # 设备配置
-os.environ['CUDA_VISIBLE_DEVICES'] = '6'
+os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 
 
 def normalize_state_dict(state_dict):
@@ -112,17 +112,85 @@ class TestDataset(Dataset):
         return img_A, img_B, img_B, label, img_name  # img_C 用 img_B 代替
 
 
+def extract_iou_from_filename(filename):
+    """
+    从文件名中提取 IoU 值
+    
+    Args:
+        filename: 文件名，如 'gold_376IoU66.63.pth'
+        
+    Returns:
+        IoU 值（float），如果无法解析则返回 -1
+    """
+    import re
+    # 匹配 IoU 后面的数字，支持小数
+    match = re.search(r'IoU(\d+\.?\d*)', filename, re.IGNORECASE)
+    if match:
+        try:
+            return float(match.group(1))
+        except ValueError:
+            return -1
+    return -1
+
+
 def load_model(checkpoint_path, device='cuda'):
     """
     加载模型权重，自动处理键名不匹配问题
     
     Args:
-        checkpoint_path: 权重文件路径
+        checkpoint_path: 权重文件路径或目录
         device: 运行设备
         
     Returns:
         加载好权重的模型
     """
+    # 如果是目录，自动查找权重文件
+    if os.path.isdir(checkpoint_path):
+        # 优先级: best_checkpoint.pth > IoU最高的.pth > last_checkpoint.pth
+        
+        # 1. 首先查找 best_checkpoint.pth
+        best_path = os.path.join(checkpoint_path, 'best_checkpoint.pth')
+        if os.path.exists(best_path):
+            checkpoint_path = best_path
+            print(f"找到 best_checkpoint.pth")
+        else:
+            # 2. 查找所有 .pth 文件并按 IoU 排序
+            all_pth_files = [f for f in os.listdir(checkpoint_path) if f.endswith('.pth')]
+            
+            if not all_pth_files:
+                raise FileNotFoundError(f"目录 {checkpoint_path} 中未找到任何 .pth 权重文件")
+            
+            # 提取包含 IoU 的文件
+            iou_files = []
+            other_files = []
+            
+            for f in all_pth_files:
+                if f == 'last_checkpoint.pth':
+                    continue  # last_checkpoint 留到最后
+                iou_value = extract_iou_from_filename(f)
+                if iou_value > 0:
+                    iou_files.append((f, iou_value))
+                else:
+                    other_files.append(f)
+            
+            # 按 IoU 降序排序
+            if iou_files:
+                iou_files.sort(key=lambda x: x[1], reverse=True)
+                checkpoint_path = os.path.join(checkpoint_path, iou_files[0][0])
+                print(f"找到 IoU 最高的权重: {iou_files[0][0]} (IoU={iou_files[0][1]})")
+            elif other_files:
+                # 3. 如果没有 IoU 文件，使用其他文件
+                checkpoint_path = os.path.join(checkpoint_path, other_files[0])
+                print(f"使用权重文件: {other_files[0]}")
+            else:
+                # 4. 最后才使用 last_checkpoint.pth
+                last_path = os.path.join(checkpoint_path, 'last_checkpoint.pth')
+                if os.path.exists(last_path):
+                    checkpoint_path = last_path
+                    print(f"使用 last_checkpoint.pth")
+                else:
+                    raise FileNotFoundError(f"目录 {checkpoint_path} 中未找到可用的权重文件")
+    
     # 创建模型
     model = Net(input_nc=3, output_nc=2).to(device)
     
@@ -304,13 +372,13 @@ def calculate_metrics(preds, labels, num_classes=2):
 def main():
     parser = argparse.ArgumentParser(description='变化检测预测脚本')
     parser.add_argument('--checkpoint', type=str, 
-                        default=r'/data/jingwei/yantingxuan/0Program/HeteCD2GOLD/checkpoints/gold/trios43/EXP20250930205453MSE+DA|MultiImgPhotoMetric|PolyLR/best_checkpoint.pth',
+                        default=r'D:\0Program\HeteCD2GOLD\checkpoints\gold\trios45\EXP20251009233202',
                         help='权重文件路径')
     parser.add_argument('--test_dir', type=str, 
-                        default=r'/data/jingwei/yantingxuan/Datasets/CityCN/Split43/test2',
+                        default=r'D:\0Program\Datasets\241120\Compare\Datas\Split45\test',
                         help='测试数据目录（包含 A、B 子目录）')
     parser.add_argument('--output_dir', type=str, 
-                        default='/data/jingwei/yantingxuan/0Program/HeteCD2GOLD/results2',
+                        default=r'D:\0Program\HeteCD2GOLD\results',
                         help='结果保存目录')
     parser.add_argument('--batch_size', type=int, default=4, help='批次大小')
     parser.add_argument('--no_vis', action='store_true', help='不保存可视化结果')

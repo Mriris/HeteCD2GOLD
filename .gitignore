@@ -9,3 +9,4 @@ open-cd/
 .triton_cache/
 .extra_libs/
 /results*
+.cursor

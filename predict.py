@@ -9,6 +9,7 @@ from PIL import Image
 from tqdm import tqdm
 import cv2
 import warnings
+import time
 from models.hetecd import hetecd as Net
 from utils.utils import get_confuse_matrix, cm2score
 
@@ -369,20 +370,120 @@ def calculate_metrics(preds, labels, num_classes=2):
     return scores
 
 
+def count_parameters(model):
+    """
+    计算模型参数量
+    
+    Args:
+        model: PyTorch 模型
+        
+    Returns:
+        参数量（单位：百万）
+    """
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return total_params / 1e6, trainable_params / 1e6
+
+
+def calculate_flops(model, input_shape=(1, 3, 256, 256), device='cuda'):
+    """
+    计算模型 FLOPs
+    
+    Args:
+        model: PyTorch 模型
+        input_shape: 输入张量形状 (B, C, H, W)
+        device: 运行设备
+        
+    Returns:
+        FLOPs（单位：十亿）
+    """
+    try:
+        from thop import profile
+        # 创建三个输入（img_A, img_B, img_C）
+        inputs = (
+            torch.randn(input_shape).to(device),
+            torch.randn(input_shape).to(device),
+            torch.randn(input_shape).to(device)
+        )
+        flops, params = profile(model, inputs=inputs, verbose=False)
+        return flops / 1e9  # 转换为 G
+    except ImportError:
+        print("警告: 未安装 thop 库，无法计算 FLOPs")
+        print("请运行: pip install thop")
+        return -1
+    except Exception as e:
+        print(f"警告: 计算 FLOPs 时出错: {e}")
+        return -1
+
+
+def measure_inference_speed(model, test_loader, device='cuda', warmup=10, num_iterations=100):
+    """
+    测量模型推理速度
+    
+    Args:
+        model: PyTorch 模型
+        test_loader: 测试数据加载器
+        device: 运行设备
+        warmup: 预热次数
+        num_iterations: 测试迭代次数
+        
+    Returns:
+        平均推理时间（单位：毫秒）
+    """
+    model.eval()
+    
+    # 获取一个批次的数据用于测试
+    test_iter = iter(test_loader)
+    try:
+        img_A, img_B, img_C, _, _ = next(test_iter)
+    except StopIteration:
+        print("警告: 测试集为空，无法测量推理速度")
+        return -1
+    
+    img_A = img_A.to(device)
+    img_B = img_B.to(device)
+    img_C = img_C.to(device)
+    
+    # 预热
+    with torch.no_grad():
+        for _ in range(warmup):
+            _ = model(img_A, img_B, img_C)
+    
+    # 测量时间
+    if device == 'cuda':
+        torch.cuda.synchronize()
+    
+    timings = []
+    with torch.no_grad():
+        for _ in range(num_iterations):
+            start_time = time.time()
+            _ = model(img_A, img_B, img_C)
+            if device == 'cuda':
+                torch.cuda.synchronize()
+            end_time = time.time()
+            timings.append((end_time - start_time) * 1000)  # 转换为毫秒
+    
+    avg_time = np.mean(timings)
+    std_time = np.std(timings)
+    
+    return avg_time, std_time
+
+
 def main():
     parser = argparse.ArgumentParser(description='变化检测预测脚本')
     parser.add_argument('--checkpoint', type=str, 
-                        default=r'D:\0Program\HeteCD2GOLD\checkpoints\gold\trios45\EXP20251009233202',
+                        default=r'D:\0Program\HeteCD2GOLD\checkpoints\gold\trios43\EXP20250930205453',
                         help='权重文件路径')
     parser.add_argument('--test_dir', type=str, 
-                        default=r'D:\0Program\Datasets\241120\Compare\Datas\Split45\test',
+                        default=r'D:\0Program\Datasets\241120\Compare\Datas\Split43\test',
                         help='测试数据目录（包含 A、B 子目录）')
     parser.add_argument('--output_dir', type=str, 
-                        default=r'D:\0Program\HeteCD2GOLD\results',
+                        default=r'D:\0Program\HeteCD2GOLD\results\trios43',
                         help='结果保存目录')
     parser.add_argument('--batch_size', type=int, default=4, help='批次大小')
     parser.add_argument('--no_vis', action='store_true', help='不保存可视化结果')
     parser.add_argument('--device', type=str, default='cuda', help='运行设备')
+    parser.add_argument('--input_size', type=int, default=512, help='输入图像尺寸（用于计算FLOPs）')
     
     args = parser.parse_args()
     
@@ -403,6 +504,34 @@ def main():
         pin_memory=True
     )
     
+    # 计算模型复杂度指标
+    print("\n" + "="*70)
+    print("模型复杂度分析")
+    print("="*70)
+    
+    # 参数量
+    total_params, trainable_params = count_parameters(model)
+    print(f"总参数量: {total_params:.2f}M")
+    print(f"可训练参数量: {trainable_params:.2f}M")
+    
+    # FLOPs
+    print("\n计算 FLOPs...")
+    flops = calculate_flops(model, input_shape=(1, 3, args.input_size, args.input_size), device=device)
+    if flops > 0:
+        print(f"FLOPs: {flops:.2f}G (输入尺寸: {args.input_size}x{args.input_size})")
+    
+    # 推理速度
+    print("\n测量推理速度...")
+    speed_result = measure_inference_speed(model, test_loader, device=device, warmup=10, num_iterations=100)
+    if isinstance(speed_result, tuple):
+        avg_time, std_time = speed_result
+        print(f"推理速度: {avg_time:.2f} ± {std_time:.2f} ms")
+    else:
+        avg_time = speed_result
+        std_time = 0
+        if avg_time > 0:
+            print(f"推理速度: {avg_time:.2f} ms")
+    
     # 执行预测
     preds, labels = predict(
         model, 
@@ -414,38 +543,65 @@ def main():
     
     # 计算指标
     if labels is not None:
-        print("\n" + "="*50)
+        print("\n" + "="*70)
         print("评估指标:")
-        print("="*50)
+        print("="*70)
         
         metrics = calculate_metrics(preds, labels)
         
         if metrics:
-            # 打印主要指标
-            print(f"整体准确率 (Accuracy): {metrics['acc']*100:.2f}%")
-            print(f"平均IoU (mIoU): {metrics['miou']*100:.2f}%")
-            print(f"平均F1分数 (mF1): {metrics['mf1']*100:.2f}%")
+            # 获取模型名称
+            method_name = "GOLD"
             
-            # 打印类别IoU
-            print(f"\n类别IoU:")
-            print(f"  背景 (IoU_0): {metrics['iou_0']*100:.2f}%")
-            print(f"  变化 (IoU_1): {metrics['iou_1']*100:.2f}%")
+            # 准备表格数据
+            precision = metrics['precision_1'] * 100  # 变化类精确率
+            recall = metrics['recall_1'] * 100  # 变化类召回率
+            f1 = metrics['F1_1'] * 100  # 变化类F1
+            iou = metrics['iou_1'] * 100  # 变化类IoU
             
-            # 打印类别F1
-            print(f"\n类别F1:")
-            print(f"  背景 (F1_0): {metrics['F1_0']*100:.2f}%")
-            print(f"  变化 (F1_1): {metrics['F1_1']*100:.2f}%")
+            # 打印表格
+            print("\n综合性能指标表:")
+            print("-" * 120)
+            print(f"{'Method':<15} | {'Precision':<10} | {'Recall':<10} | {'F1':<10} | {'IoU':<10} | {'Params(M)':<12} | {'FLOPs(G)':<12} | {'Speed(ms)':<15}")
+            print("-" * 120)
             
-            # 打印精确率和召回率
-            print(f"\n精确率和召回率:")
-            print(f"  变化类精确率: {metrics['precision_1']*100:.2f}%")
-            print(f"  变化类召回率: {metrics['recall_1']*100:.2f}%")
+            flops_str = f"{flops:.2f}" if flops > 0 else "N/A"
+            speed_str = f"{avg_time:.2f}" if avg_time > 0 else "N/A"
+            
+            print(f"{method_name:<15} | {precision:>9.2f}% | {recall:>9.2f}% | {f1:>9.2f}% | {iou:>9.2f}% | {total_params:>11.2f} | {flops_str:>11} | {speed_str:>14}")
+            print("-" * 120)
+            
+            # 打印详细指标
+            print(f"\n详细指标:")
+            print(f"  整体准确率 (Accuracy): {metrics['acc']*100:.2f}%")
+            print(f"  平均IoU (mIoU): {metrics['miou']*100:.2f}%")
+            print(f"  平均F1分数 (mF1): {metrics['mf1']*100:.2f}%")
+            
+            print(f"\n  类别IoU:")
+            print(f"    背景 (IoU_0): {metrics['iou_0']*100:.2f}%")
+            print(f"    变化 (IoU_1): {metrics['iou_1']*100:.2f}%")
+            
+            print(f"\n  类别F1:")
+            print(f"    背景 (F1_0): {metrics['F1_0']*100:.2f}%")
+            print(f"    变化 (F1_1): {metrics['F1_1']*100:.2f}%")
             
             # 保存指标到文件
             metrics_path = os.path.join(args.output_dir, 'metrics.txt')
             with open(metrics_path, 'w', encoding='utf-8') as f:
+                f.write("="*70 + "\n")
+                f.write("综合性能指标\n")
+                f.write("="*70 + "\n\n")
+                
+                # 写入表格
+                f.write("-" * 120 + "\n")
+                f.write(f"{'Method':<15} | {'Precision':<10} | {'Recall':<10} | {'F1':<10} | {'IoU':<10} | {'Params(M)':<12} | {'FLOPs(G)':<12} | {'Speed(ms)':<15}\n")
+                f.write("-" * 120 + "\n")
+                f.write(f"{method_name:<15} | {precision:>9.2f}% | {recall:>9.2f}% | {f1:>9.2f}% | {iou:>9.2f}% | {total_params:>11.2f} | {flops_str:>11} | {speed_str:>14}\n")
+                f.write("-" * 120 + "\n\n")
+                
+                # 写入详细指标
                 f.write("="*50 + "\n")
-                f.write("评估指标\n")
+                f.write("详细评估指标\n")
                 f.write("="*50 + "\n\n")
                 f.write(f"整体准确率 (Accuracy): {metrics['acc']*100:.2f}%\n")
                 f.write(f"平均IoU (mIoU): {metrics['miou']*100:.2f}%\n")
@@ -458,7 +614,21 @@ def main():
                 f.write(f"  变化 (F1_1): {metrics['F1_1']*100:.2f}%\n\n")
                 f.write(f"精确率和召回率:\n")
                 f.write(f"  变化类精确率: {metrics['precision_1']*100:.2f}%\n")
-                f.write(f"  变化类召回率: {metrics['recall_1']*100:.2f}%\n")
+                f.write(f"  变化类召回率: {metrics['recall_1']*100:.2f}%\n\n")
+                
+                # 写入模型复杂度
+                f.write("="*50 + "\n")
+                f.write("模型复杂度\n")
+                f.write("="*50 + "\n\n")
+                f.write(f"总参数量: {total_params:.2f}M\n")
+                f.write(f"可训练参数量: {trainable_params:.2f}M\n")
+                if flops > 0:
+                    f.write(f"FLOPs: {flops:.2f}G\n")
+                if avg_time > 0:
+                    if isinstance(speed_result, tuple):
+                        f.write(f"推理速度: {avg_time:.2f} ± {std_time:.2f} ms\n")
+                    else:
+                        f.write(f"推理速度: {avg_time:.2f} ms\n")
             
             print(f"\n指标已保存至: {metrics_path}")
     

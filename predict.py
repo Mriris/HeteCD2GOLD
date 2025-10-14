@@ -19,6 +19,31 @@ warnings.filterwarnings('ignore', category=UserWarning, module='skimage')
 # 设备配置
 os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 
+# ===== 顶部参数配置（可直接在此处修改） =====
+# 说明：
+# - 若不传命令行参数，将使用这里的默认值
+# - 命令行参数依然可覆盖这些默认值
+CHECKPOINT = r'D:\0Program\HeteCD2GOLD\checkpoints\gold\trios43\EXP20250930205453'
+TEST_DIR = r'D:\0Program\Datasets\241120\Compare\Datas\AIO0'
+OUTPUT_DIR = r'D:\0Program\HeteCD2GOLD\results\AIO0'
+BATCH_SIZE = 4
+DEVICE = 'cuda'
+INPUT_SIZE = 512  # 用于 FLOPs 计算的输入尺寸
+
+# 可视化输出控制（仅在有 label 时生效）
+SAVE_PRED = False   # 是否保存预测结果 (_pred.png)
+SAVE_LABEL = False  # 是否保存真值标签 (_label.png)
+SAVE_ERROR = True  # 是否保存误差可视化 (_error.png)
+
+# 推理速度测量为可选步骤
+MEASURE_SPEED = False  # 是否测量推理速度（默认关闭）
+SPEED_WARMUP = 10      # 推理速度预热次数
+SPEED_ITERS = 100      # 推理速度测量迭代次数
+
+# DataLoader 相关
+NUM_WORKERS = 4
+PIN_MEMORY = True
+
 
 def normalize_state_dict(state_dict):
     """
@@ -57,11 +82,10 @@ def normalize_state_dict(state_dict):
 class TestDataset(Dataset):
     """
     测试数据集类，支持 test/A 和 test/B 格式
-    可选地读取 test/label 用于评估
+    自动检测 test/label 是否存在用于评估
     """
-    def __init__(self, test_dir, has_label=True):
+    def __init__(self, test_dir):
         self.test_dir = test_dir
-        self.has_label = has_label
         
         # 读取图像路径
         img_A_dir = os.path.join(test_dir, 'A')
@@ -72,12 +96,14 @@ class TestDataset(Dataset):
         
         self.img_names = sorted([f for f in os.listdir(img_A_dir) if f.endswith(('.png', '.tif', '.jpg'))])
         
-        # 如果有标签，检查标签目录
-        if has_label:
-            label_dir = os.path.join(test_dir, 'label')
-            if not os.path.exists(label_dir):
-                print(f"警告: 标签目录不存在 {label_dir}，将不计算指标")
-                self.has_label = False
+        # 自动检测标签目录是否存在
+        label_dir = os.path.join(test_dir, 'label')
+        self.has_label = os.path.exists(label_dir)
+        
+        if self.has_label:
+            print(f"检测到标签目录，将计算评估指标")
+        else:
+            print(f"未检测到标签目录，将仅输出预测结果")
         
         print(f"加载了 {len(self.img_names)} 个测试样本")
     
@@ -261,7 +287,7 @@ def create_error_visualization(pred, label):
     return vis
 
 
-def predict(model, test_loader, save_dir, device='cuda', save_vis=True):
+def predict(model, test_loader, save_dir, device='cuda', save_pred=True, save_label=True, save_error=True):
     """
     执行预测并保存结果
     
@@ -270,7 +296,9 @@ def predict(model, test_loader, save_dir, device='cuda', save_vis=True):
         test_loader: 测试数据加载器
         save_dir: 保存目录
         device: 运行设备
-        save_vis: 是否保存可视化结果
+        save_pred: 是否保存预测结果 (_pred.png)
+        save_label: 是否保存真值标签 (_label.png)
+        save_error: 是否保存误差可视化 (_error.png)
         
     Returns:
         预测结果和标签（用于计算指标）
@@ -317,30 +345,43 @@ def predict(model, test_loader, save_dir, device='cuda', save_vis=True):
                     all_preds.append(pred_binary[i])
                     all_labels.append(label_np)
                     
-                    if save_vis:
-                        # 保存真值
+                    # 保存真值
+                    if save_label:
                         label_img = label_np * 255
                         label_path = os.path.join(save_dir, f"{os.path.splitext(name)[0]}_label.png")
                         io.imsave(label_path, label_img.astype(np.uint8))
-                        
-                        # 保存预测值
+                    
+                    # 保存预测值
+                    if save_pred:
                         pred_vis_path = os.path.join(save_dir, f"{os.path.splitext(name)[0]}_pred.png")
                         io.imsave(pred_vis_path, pred_img.astype(np.uint8))
-                        
-                        # 保存误差可视化
+                    
+                    # 保存误差可视化
+                    if save_error:
                         error_vis = create_error_visualization(pred_binary[i], label_np)
                         error_path = os.path.join(save_dir, f"{os.path.splitext(name)[0]}_error.png")
                         cv2.imwrite(error_path, error_vis)
                 else:
                     # 没有标签时，只保存预测二值图
                     all_preds.append(pred_binary[i])
-                    if save_vis:
+                    if save_pred:
                         pred_path = os.path.join(save_dir, f"{os.path.splitext(name)[0]}_pred.png")
                         io.imsave(pred_path, pred_img.astype(np.uint8))
     
     print(f"\n预测完成！结果保存至: {save_dir}")
     if has_label:
-        print(f"生成了 {len(all_preds)} 组可视化结果（label、pred、error）")
+        saved_types = []
+        if save_label:
+            saved_types.append("label")
+        if save_pred:
+            saved_types.append("pred")
+        if save_error:
+            saved_types.append("error")
+        if saved_types:
+            print(f"生成了 {len(all_preds)} 组可视化结果（{', '.join(saved_types)}）")
+    else:
+        if save_pred:
+            print(f"生成了 {len(all_preds)} 个预测结果")
     
     return all_preds, all_labels if has_label else None
 
@@ -472,18 +513,29 @@ def measure_inference_speed(model, test_loader, device='cuda', warmup=10, num_it
 def main():
     parser = argparse.ArgumentParser(description='变化检测预测脚本')
     parser.add_argument('--checkpoint', type=str, 
-                        default=r'D:\0Program\HeteCD2GOLD\checkpoints\gold\trios43\EXP20250930205453',
+                        default=CHECKPOINT,
                         help='权重文件路径')
     parser.add_argument('--test_dir', type=str, 
-                        default=r'D:\0Program\Datasets\241120\Compare\Datas\Split43\test',
+                        default=TEST_DIR,
                         help='测试数据目录（包含 A、B 子目录）')
     parser.add_argument('--output_dir', type=str, 
-                        default=r'D:\0Program\HeteCD2GOLD\results\trios43',
+                        default=OUTPUT_DIR,
                         help='结果保存目录')
-    parser.add_argument('--batch_size', type=int, default=4, help='批次大小')
-    parser.add_argument('--no_vis', action='store_true', help='不保存可视化结果')
-    parser.add_argument('--device', type=str, default='cuda', help='运行设备')
-    parser.add_argument('--input_size', type=int, default=512, help='输入图像尺寸（用于计算FLOPs）')
+    parser.add_argument('--batch_size', type=int, default=BATCH_SIZE, help='批次大小')
+    parser.add_argument('--device', type=str, default=DEVICE, help='运行设备')
+    parser.add_argument('--input_size', type=int, default=INPUT_SIZE, help='输入图像尺寸（用于计算FLOPs）')
+    # 可视化输出控制
+    parser.add_argument('--save_pred', action='store_true', default=None, help='保存预测结果')
+    parser.add_argument('--no_save_pred', action='store_true', default=None, help='不保存预测结果')
+    parser.add_argument('--save_label', action='store_true', default=None, help='保存真值标签')
+    parser.add_argument('--no_save_label', action='store_true', default=None, help='不保存真值标签')
+    parser.add_argument('--save_error', action='store_true', default=None, help='保存误差可视化')
+    parser.add_argument('--no_save_error', action='store_true', default=None, help='不保存误差可视化')
+    # 可选推理速度测量
+    parser.add_argument('--measure_speed', action='store_true', default=None, help='测量推理速度（覆盖顶部默认）')
+    parser.add_argument('--no_measure_speed', action='store_true', default=None, help='禁止测量推理速度（覆盖顶部默认）')
+    parser.add_argument('--speed_warmup', type=int, default=SPEED_WARMUP, help='推理速度预热次数')
+    parser.add_argument('--speed_iters', type=int, default=SPEED_ITERS, help='推理速度测量迭代次数')
     
     args = parser.parse_args()
     
@@ -491,17 +543,43 @@ def main():
     device = torch.device(args.device if torch.cuda.is_available() else 'cpu')
     print(f"使用设备: {device}")
     
+    # 解析可视化输出开关
+    save_pred = SAVE_PRED
+    if args.save_pred is True:
+        save_pred = True
+    elif args.no_save_pred is True:
+        save_pred = False
+    
+    save_label = SAVE_LABEL
+    if args.save_label is True:
+        save_label = True
+    elif args.no_save_label is True:
+        save_label = False
+    
+    save_error = SAVE_ERROR
+    if args.save_error is True:
+        save_error = True
+    elif args.no_save_error is True:
+        save_error = False
+
+    # 解析速度测量开关
+    measure_speed = MEASURE_SPEED
+    if args.measure_speed is True:
+        measure_speed = True
+    elif args.no_measure_speed is True:
+        measure_speed = False
+
     # 加载模型
     model = load_model(args.checkpoint, device)
     
-    # 创建数据集
-    test_dataset = TestDataset(args.test_dir, has_label=True)
+    # 创建数据集（自动检测是否有 label）
+    test_dataset = TestDataset(args.test_dir)
     test_loader = DataLoader(
         test_dataset,
         batch_size=args.batch_size,
         shuffle=False,
-        num_workers=4,
-        pin_memory=True
+        num_workers=NUM_WORKERS,
+        pin_memory=PIN_MEMORY
     )
     
     # 计算模型复杂度指标
@@ -520,17 +598,21 @@ def main():
     if flops > 0:
         print(f"FLOPs: {flops:.2f}G (输入尺寸: {args.input_size}x{args.input_size})")
     
-    # 推理速度
-    print("\n测量推理速度...")
-    speed_result = measure_inference_speed(model, test_loader, device=device, warmup=10, num_iterations=100)
-    if isinstance(speed_result, tuple):
-        avg_time, std_time = speed_result
-        print(f"推理速度: {avg_time:.2f} ± {std_time:.2f} ms")
-    else:
-        avg_time = speed_result
-        std_time = 0
-        if avg_time > 0:
-            print(f"推理速度: {avg_time:.2f} ms")
+    # 推理速度（可选）
+    avg_time, std_time = -1, -1
+    if measure_speed:
+        print("\n测量推理速度...")
+        speed_result = measure_inference_speed(
+            model, test_loader, device=device, warmup=args.speed_warmup, num_iterations=args.speed_iters
+        )
+        if isinstance(speed_result, tuple):
+            avg_time, std_time = speed_result
+            print(f"推理速度: {avg_time:.2f} ± {std_time:.2f} ms")
+        else:
+            avg_time = speed_result
+            std_time = 0
+            if avg_time > 0:
+                print(f"推理速度: {avg_time:.2f} ms")
     
     # 执行预测
     preds, labels = predict(
@@ -538,7 +620,9 @@ def main():
         test_loader, 
         args.output_dir, 
         device, 
-        save_vis=not args.no_vis
+        save_pred=save_pred,
+        save_label=save_label,
+        save_error=save_error
     )
     
     # 计算指标
@@ -566,7 +650,7 @@ def main():
             print("-" * 120)
             
             flops_str = f"{flops:.2f}" if flops > 0 else "N/A"
-            speed_str = f"{avg_time:.2f}" if avg_time > 0 else "N/A"
+            speed_str = f"{avg_time:.2f}" if (isinstance(avg_time, (int, float)) and avg_time > 0) else "N/A"
             
             print(f"{method_name:<15} | {precision:>9.2f}% | {recall:>9.2f}% | {f1:>9.2f}% | {iou:>9.2f}% | {total_params:>11.2f} | {flops_str:>11} | {speed_str:>14}")
             print("-" * 120)
@@ -624,8 +708,8 @@ def main():
                 f.write(f"可训练参数量: {trainable_params:.2f}M\n")
                 if flops > 0:
                     f.write(f"FLOPs: {flops:.2f}G\n")
-                if avg_time > 0:
-                    if isinstance(speed_result, tuple):
+                if isinstance(avg_time, (int, float)) and avg_time > 0:
+                    if isinstance(std_time, (int, float)) and std_time > 0:
                         f.write(f"推理速度: {avg_time:.2f} ± {std_time:.2f} ms\n")
                     else:
                         f.write(f"推理速度: {avg_time:.2f} ms\n")

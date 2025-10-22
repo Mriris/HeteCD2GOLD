@@ -1549,8 +1549,8 @@ class hetecd(nn.Module):
             x2: 时间点2 SAR图像  
             x3: 时间点2光学图像（可选，仅训练时使用）
         Returns:
-            训练时（有x3）: student_pred, features, teacher_pred
-            推理时（无x3）: student_pred, features
+            当提供 x3 且启用教师网络时：返回 (student_pred, 学生特征, teacher_pred, 教师特征)
+            否则：返回 (student_pred, 学生特征)
         """
         x_size = x1.size() 
         [fx1, fx2] = [self.optical_encoder(x1), self.sar_encoder(x2)]
@@ -1561,8 +1561,8 @@ class hetecd(nn.Module):
         cp = self.CD_Decoder(fx1, fx2)
         student_pred = F.interpolate(cp[-1], size=x_size[2:], mode='bilinear', align_corners=False)
         
-        # 如果有第三个输入且在训练模式，使用教师网络
-        if x3 is not None and self.training and self.use_teacher:
+        # 如果提供 x3，启用教师网络（训练与验证均可）
+        if x3 is not None and self.use_teacher:
             fx3 = self.optical_encoder(x3)  # 时间点2光学特征
             c1_3, c2_3, c3_3, c4_3 = fx3
             teacher_output = self.teacher_decoder(fx1, fx3)  

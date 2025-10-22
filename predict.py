@@ -23,9 +23,9 @@ os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 # 说明：
 # - 若不传命令行参数，将使用这里的默认值
 # - 命令行参数依然可覆盖这些默认值
-CHECKPOINT = r'D:\0Program\HeteCD2GOLD\checkpoints\gold\trios43\EXP20250930205453'
-TEST_DIR = r'D:\0Program\Datasets\241120\Compare\Datas\AIO0'
-OUTPUT_DIR = r'D:\0Program\HeteCD2GOLD\results\AIO0'
+CHECKPOINT = r'/data/jingwei/yantingxuan/0Program/HeteCD2GOLD/checkpoints/gold/trios45/EXP20251021225208MSE+DA|MultiImgPhotoMetric|PolyLR/gold_teacher_398IoU66.24.pth'
+TEST_DIR = r'/data/jingwei/yantingxuan/Datasets/CityCN/Split45/val'
+OUTPUT_DIR = r'/data/jingwei/yantingxuan/0Program/HeteCD2GOLD/results'
 BATCH_SIZE = 4
 DEVICE = 'cuda'
 INPUT_SIZE = 512  # 用于 FLOPs 计算的输入尺寸
@@ -81,18 +81,35 @@ def normalize_state_dict(state_dict):
 
 class TestDataset(Dataset):
     """
-    测试数据集类，支持 test/A 和 test/B 格式
+    测试数据集类，支持学生网络（A+B）和教师网络（A+C）
     自动检测 test/label 是否存在用于评估
+    
+    Args:
+        test_dir: 测试数据目录
+        use_teacher_mode: 是否为教师网络模式（True: 使用 A+C，False: 使用 A+B）
     """
-    def __init__(self, test_dir):
+    def __init__(self, test_dir, use_teacher_mode=False):
         self.test_dir = test_dir
+        self.use_teacher_mode = use_teacher_mode
         
         # 读取图像路径
         img_A_dir = os.path.join(test_dir, 'A')
-        img_B_dir = os.path.join(test_dir, 'B')
         
-        if not os.path.exists(img_A_dir) or not os.path.exists(img_B_dir):
-            raise ValueError(f"数据集目录不存在: {img_A_dir} 或 {img_B_dir}")
+        # 根据模式选择第二个输入目录
+        if use_teacher_mode:
+            img_second_dir = os.path.join(test_dir, 'C')
+            mode_name = "教师模式（A+C 同源）"
+        else:
+            img_second_dir = os.path.join(test_dir, 'B')
+            mode_name = "学生模式（A+B 异源）"
+        
+        if not os.path.exists(img_A_dir):
+            raise ValueError(f"数据集目录 A 不存在: {img_A_dir}")
+        if not os.path.exists(img_second_dir):
+            raise ValueError(f"数据集目录 {'C' if use_teacher_mode else 'B'} 不存在: {img_second_dir}")
+        
+        self.img_A_dir = img_A_dir
+        self.img_second_dir = img_second_dir
         
         self.img_names = sorted([f for f in os.listdir(img_A_dir) if f.endswith(('.png', '.tif', '.jpg'))])
         
@@ -100,6 +117,7 @@ class TestDataset(Dataset):
         label_dir = os.path.join(test_dir, 'label')
         self.has_label = os.path.exists(label_dir)
         
+        print(f"数据集模式: {mode_name}")
         if self.has_label:
             print(f"检测到标签目录，将计算评估指标")
         else:
@@ -113,16 +131,28 @@ class TestDataset(Dataset):
     def __getitem__(self, idx):
         img_name = self.img_names[idx]
         
-        # 读取图像
-        img_A_path = os.path.join(self.test_dir, 'A', img_name)
-        img_B_path = os.path.join(self.test_dir, 'B', img_name)
-        
+        # 读取图像 A（时间点1，光学）
+        img_A_path = os.path.join(self.img_A_dir, img_name)
         img_A = io.imread(img_A_path)
-        img_B = io.imread(img_B_path)
         
-        # 转换为张量并归一化到 [0, 1]
-        img_A = torch.from_numpy(img_A).permute(2, 0, 1).float() / 255.0
-        img_B = torch.from_numpy(img_B).permute(2, 0, 1).float() / 255.0
+        # 教师模式只需要 A 和 C
+        if self.use_teacher_mode:
+            # 读取 C（光学）
+            img_C_path = os.path.join(self.img_second_dir, img_name)
+            img_C = io.imread(img_C_path)
+            
+            # 转换为张量
+            img_A = torch.from_numpy(img_A).permute(2, 0, 1).float() / 255.0
+            img_C = torch.from_numpy(img_C).permute(2, 0, 1).float() / 255.0
+            img_B = img_A  # 教师模式不需要 B，用 A 占位（避免 sar_encoder 处理错误类型）
+        else:
+            # 学生模式只需要 A 和 B
+            img_B_path = os.path.join(self.img_second_dir, img_name)
+            img_B = io.imread(img_B_path)
+            
+            img_A = torch.from_numpy(img_A).permute(2, 0, 1).float() / 255.0
+            img_B = torch.from_numpy(img_B).permute(2, 0, 1).float() / 255.0
+            img_C = img_B  # 学生模式不需要 C，用 B 占位
         
         # 读取标签（如果存在）
         label = None
@@ -136,7 +166,9 @@ class TestDataset(Dataset):
                 # 单个样本缺失标签则返回 None，不影响其他样本
                 label = None
         
-        return img_A, img_B, img_B, label, img_name  # img_C 用 img_B 代替
+        # 统一返回格式：A, B, C
+        # 训练时模型期望 forward(A, B, C)
+        return img_A, img_B, img_C, label, img_name
 
 
 def extract_iou_from_filename(filename):
@@ -160,17 +192,20 @@ def extract_iou_from_filename(filename):
     return -1
 
 
-def load_model(checkpoint_path, device='cuda'):
+def load_model(checkpoint_path, device='cuda', force_teacher=None):
     """
     加载模型权重，自动处理键名不匹配问题
     
     Args:
         checkpoint_path: 权重文件路径或目录
         device: 运行设备
+        force_teacher: 强制指定是否为教师模式（None=自动检测，True=教师，False=学生）
         
     Returns:
-        加载好权重的模型
+        加载好权重的模型, 是否为教师模式
     """
+    is_teacher_weight = False
+    
     # 如果是目录，自动查找权重文件
     if os.path.isdir(checkpoint_path):
         # 优先级: best_checkpoint.pth > IoU最高的.pth > last_checkpoint.pth
@@ -187,8 +222,9 @@ def load_model(checkpoint_path, device='cuda'):
             if not all_pth_files:
                 raise FileNotFoundError(f"目录 {checkpoint_path} 中未找到任何 .pth 权重文件")
             
-            # 提取包含 IoU 的文件
-            iou_files = []
+            # 提取包含 IoU 的文件（区分教师和学生权重）
+            student_iou_files = []
+            teacher_iou_files = []
             other_files = []
             
             for f in all_pth_files:
@@ -196,15 +232,36 @@ def load_model(checkpoint_path, device='cuda'):
                     continue  # last_checkpoint 留到最后
                 iou_value = extract_iou_from_filename(f)
                 if iou_value > 0:
-                    iou_files.append((f, iou_value))
+                    if 'teacher' in f.lower():
+                        teacher_iou_files.append((f, iou_value))
+                    else:
+                        student_iou_files.append((f, iou_value))
                 else:
                     other_files.append(f)
             
+            # 根据 force_teacher 参数选择权重
+            selected_files = None
+            if force_teacher is True:
+                selected_files = teacher_iou_files
+                is_teacher_weight = True
+            elif force_teacher is False:
+                selected_files = student_iou_files
+                is_teacher_weight = False
+            else:
+                # 自动选择：优先学生权重
+                if student_iou_files:
+                    selected_files = student_iou_files
+                    is_teacher_weight = False
+                elif teacher_iou_files:
+                    selected_files = teacher_iou_files
+                    is_teacher_weight = True
+            
             # 按 IoU 降序排序
-            if iou_files:
-                iou_files.sort(key=lambda x: x[1], reverse=True)
-                checkpoint_path = os.path.join(checkpoint_path, iou_files[0][0])
-                print(f"找到 IoU 最高的权重: {iou_files[0][0]} (IoU={iou_files[0][1]})")
+            if selected_files:
+                selected_files.sort(key=lambda x: x[1], reverse=True)
+                checkpoint_path = os.path.join(checkpoint_path, selected_files[0][0])
+                weight_type = "教师" if is_teacher_weight else "学生"
+                print(f"找到 IoU 最高的{weight_type}权重: {selected_files[0][0]} (IoU={selected_files[0][1]})")
             elif other_files:
                 # 3. 如果没有 IoU 文件，使用其他文件
                 checkpoint_path = os.path.join(checkpoint_path, other_files[0])
@@ -217,6 +274,10 @@ def load_model(checkpoint_path, device='cuda'):
                     print(f"使用 last_checkpoint.pth")
                 else:
                     raise FileNotFoundError(f"目录 {checkpoint_path} 中未找到可用的权重文件")
+    else:
+        # 直接指定文件时，从文件名判断
+        filename = os.path.basename(checkpoint_path)
+        is_teacher_weight = 'teacher' in filename.lower()
     
     # 创建模型
     model = Net(input_nc=3, output_nc=2).to(device)
@@ -236,20 +297,92 @@ def load_model(checkpoint_path, device='cuda'):
     # 规范化键名
     state_dict = normalize_state_dict(state_dict)
     
-    # 加载权重
-    missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+    # 检查是否为教师专用权重（仅包含 optical_encoder 和 teacher_decoder）
+    has_only_teacher = all(
+        k.startswith('optical_encoder.') or k.startswith('teacher_decoder.')
+        for k in state_dict.keys()
+    )
     
-    # 报告加载情况
-    if len(missing_keys) == 0 and len(unexpected_keys) == 0:
-        print("✓ 权重完整加载成功")
+    if has_only_teacher and not is_teacher_weight:
+        print("⚠ 检测到教师专用权重，自动切换到教师模式")
+        is_teacher_weight = True
+    
+    # 如果是教师专用权重，需要从完整checkpoint或best_checkpoint加载学生部分进行补全
+    if has_only_teacher:
+        print("检测到教师专用权重（仅 optical_encoder + teacher_decoder），正在加载完整模型进行补全...")
+        
+        # 查找对应的完整权重文件
+        base_dir = os.path.dirname(checkpoint_path)
+        complete_checkpoint = None
+        
+        # 优先使用 best_checkpoint.pth
+        best_path = os.path.join(base_dir, 'best_checkpoint.pth')
+        if os.path.exists(best_path):
+            complete_checkpoint = best_path
+        else:
+            # 查找同epoch的完整权重
+            filename = os.path.basename(checkpoint_path)
+            # 从 gold_teacher_398IoU66.24.pth 提取 epoch
+            import re
+            match = re.search(r'teacher_(\d+)IoU', filename)
+            if match:
+                epoch_num = match.group(1)
+                # 查找对应的学生权重
+                student_pattern = f"gold_{epoch_num}IoU*.pth"
+                import glob
+                candidates = glob.glob(os.path.join(base_dir, student_pattern.replace('*', '[0-9]*')))
+                if candidates:
+                    complete_checkpoint = candidates[0]
+        
+        # 如果找不到，使用 last_checkpoint
+        if complete_checkpoint is None:
+            last_path = os.path.join(base_dir, 'last_checkpoint.pth')
+            if os.path.exists(last_path):
+                complete_checkpoint = last_path
+        
+        if complete_checkpoint:
+            print(f"  使用完整权重初始化: {os.path.basename(complete_checkpoint)}")
+            complete_state = torch.load(complete_checkpoint, map_location=device)
+            if isinstance(complete_state, dict) and 'model_state' in complete_state:
+                complete_state = complete_state['model_state']
+            complete_state = normalize_state_dict(complete_state)
+            
+            # 先加载完整权重，再用教师权重覆盖
+            model.load_state_dict(complete_state, strict=False)
+            model.load_state_dict(state_dict, strict=False)
+            print("✓ 教师权重加载成功（已用完整模型补全缺失部分）")
+            missing_keys, unexpected_keys = [], []
+        else:
+            print("⚠ 未找到完整权重，教师模型部分参数未初始化，预测结果可能不正确")
+            missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
     else:
-        if len(missing_keys) > 0:
-            print(f"⚠ 缺失的键 ({len(missing_keys)}): {missing_keys[:5]}...")
-        if len(unexpected_keys) > 0:
-            print(f"⚠ 多余的键 ({len(unexpected_keys)}): {unexpected_keys[:5]}...")
+        # 加载完整权重
+        missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+        
+        # 报告加载情况
+        if len(missing_keys) == 0 and len(unexpected_keys) == 0:
+            print("✓ 权重完整加载成功")
+        else:
+            if len(missing_keys) > 0:
+                print(f"⚠ 缺失的键 ({len(missing_keys)}): {missing_keys[:5]}...")
+            if len(unexpected_keys) > 0:
+                print(f"⚠ 多余的键 ({len(unexpected_keys)}): {unexpected_keys[:5]}...")
+    
+    # 应用 force_teacher 覆盖自动检测结果
+    if force_teacher is not None:
+        is_teacher_weight = force_teacher
+    
+    weight_type = "教师网络（AC 同源）" if is_teacher_weight else "学生网络（AB 异源）"
+    print(f"模型类型: {weight_type}")
+    
+    # 教师模式下，确保 use_teacher 标志开启
+    if is_teacher_weight and hasattr(model, 'use_teacher'):
+        model.use_teacher = True
+    elif is_teacher_weight and hasattr(model, 'module') and hasattr(model.module, 'use_teacher'):
+        model.module.use_teacher = True
     
     model.eval()
-    return model
+    return model, is_teacher_weight
 
 
 def create_error_visualization(pred, label):
@@ -287,7 +420,7 @@ def create_error_visualization(pred, label):
     return vis
 
 
-def predict(model, test_loader, save_dir, device='cuda', save_pred=True, save_label=True, save_error=True):
+def predict(model, test_loader, save_dir, device='cuda', save_pred=True, save_label=True, save_error=True, use_teacher_output=False):
     """
     执行预测并保存结果
     
@@ -299,6 +432,7 @@ def predict(model, test_loader, save_dir, device='cuda', save_pred=True, save_la
         save_pred: 是否保存预测结果 (_pred.png)
         save_label: 是否保存真值标签 (_label.png)
         save_error: 是否保存误差可视化 (_error.png)
+        use_teacher_output: 是否使用教师网络输出（True 时取 output[2]，False 时取 output[0]）
         
     Returns:
         预测结果和标签（用于计算指标）
@@ -324,7 +458,10 @@ def predict(model, test_loader, save_dir, device='cuda', save_pred=True, save_la
             
             # 获取预测结果
             if isinstance(output, (list, tuple)):
-                output = output[0]  # 取第一个输出
+                if use_teacher_output and len(output) >= 3:
+                    output = output[2]  # 教师模式取第3个输出（teacher_pred）
+                else:
+                    output = output[0]  # 学生模式取第1个输出（student_pred）
             
             # 转换为概率
             pred_prob = F.softmax(output, dim=1)
@@ -517,13 +654,16 @@ def main():
                         help='权重文件路径')
     parser.add_argument('--test_dir', type=str, 
                         default=TEST_DIR,
-                        help='测试数据目录（包含 A、B 子目录）')
+                        help='测试数据目录（学生模式需要 A、B，教师模式需要 A、C）')
     parser.add_argument('--output_dir', type=str, 
                         default=OUTPUT_DIR,
                         help='结果保存目录')
     parser.add_argument('--batch_size', type=int, default=BATCH_SIZE, help='批次大小')
     parser.add_argument('--device', type=str, default=DEVICE, help='运行设备')
     parser.add_argument('--input_size', type=int, default=INPUT_SIZE, help='输入图像尺寸（用于计算FLOPs）')
+    # 教师/学生模式控制
+    parser.add_argument('--teacher', action='store_true', default=None, help='强制使用教师模式（A+C）')
+    parser.add_argument('--student', action='store_true', default=None, help='强制使用学生模式（A+B）')
     # 可视化输出控制
     parser.add_argument('--save_pred', action='store_true', default=None, help='保存预测结果')
     parser.add_argument('--no_save_pred', action='store_true', default=None, help='不保存预测结果')
@@ -569,11 +709,18 @@ def main():
     elif args.no_measure_speed is True:
         measure_speed = False
 
-    # 加载模型
-    model = load_model(args.checkpoint, device)
+    # 解析教师/学生模式
+    force_teacher = None
+    if args.teacher is True:
+        force_teacher = True
+    elif args.student is True:
+        force_teacher = False
+
+    # 加载模型（自动检测或强制指定模式）
+    model, is_teacher_mode = load_model(args.checkpoint, device, force_teacher=force_teacher)
     
-    # 创建数据集（自动检测是否有 label）
-    test_dataset = TestDataset(args.test_dir)
+    # 创建数据集（根据模型类型选择数据）
+    test_dataset = TestDataset(args.test_dir, use_teacher_mode=is_teacher_mode)
     test_loader = DataLoader(
         test_dataset,
         batch_size=args.batch_size,
@@ -622,7 +769,8 @@ def main():
         device, 
         save_pred=save_pred,
         save_label=save_label,
-        save_error=save_error
+        save_error=save_error,
+        use_teacher_output=is_teacher_mode  # 教师模式使用教师输出
     )
     
     # 计算指标
@@ -634,8 +782,8 @@ def main():
         metrics = calculate_metrics(preds, labels)
         
         if metrics:
-            # 获取模型名称
-            method_name = "GOLD"
+            # 获取模型名称（区分教师和学生）
+            method_name = "GOLD-Teacher" if is_teacher_mode else "GOLD-Student"
             
             # 准备表格数据
             precision = metrics['precision_1'] * 100  # 变化类精确率

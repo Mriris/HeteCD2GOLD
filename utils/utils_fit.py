@@ -27,6 +27,19 @@ warnings.filterwarnings("ignore", message=".*low contrast image.*")
 
 
 # 断点保存工具函数
+def _extract_teacher_state(net: nn.Module) -> dict:
+    """
+    提取教师网络相关权重（AC：`optical_encoder` + `teacher_decoder`）。
+    兼容 DataParallel 包裹。
+    """
+    model = net.module if isinstance(net, nn.DataParallel) else net
+    state = {}
+    for name, tensor in model.state_dict().items():
+        if name.startswith('optical_encoder.') or name.startswith('teacher_decoder.'):
+            state[name] = tensor
+    return state
+
+
 def save_checkpoint(
     chkpt_dir: str,
     net: nn.Module,
@@ -38,12 +51,14 @@ def save_checkpoint(
     best_loss: float,
     net_name: str,
     is_best: bool = False,
+    teacher_iou: float = None,
 ) -> None:
     """
     保存训练断点与最佳模型。
 
     - 始终写入 last_checkpoint.pth（包含模型、优化器、调度器、AMP 状态等）。
     - 当 is_best=True 时，同时写入 best_checkpoint.pth 与带 IoU 的模型权重（仅 state_dict，后缀 .pth）。
+    - teacher_iou: 教师网络的 IoU_1，用于教师权重文件命名
     """
     os.makedirs(chkpt_dir, exist_ok=True)
 
@@ -69,6 +84,19 @@ def save_checkpoint(
             f"{net_name}_{epoch}IoU{best_iou * 100:.2f}.pth",
         )
         torch.save(net.state_dict(), best_sd_path)
+        # 另存教师网络专用权重（AC：A&C -> optical_encoder + teacher_decoder）
+        try:
+            teacher_sd = _extract_teacher_state(net)
+            # 使用教师自己的 IoU 命名
+            t_iou = teacher_iou if teacher_iou is not None else best_iou
+            best_teacher_sd_path = os.path.join(
+                chkpt_dir,
+                f"{net_name}_teacher_{epoch}IoU{t_iou * 100:.2f}.pth",
+            )
+            torch.save(teacher_sd, best_teacher_sd_path)
+        except Exception:
+            # 不阻断训练
+            pass
 
 # 损失权重配置
 DEFAULT_LOSS_WEIGHTS = {
@@ -194,6 +222,7 @@ def train(train_loader, train_loader_unchange, net, criterion, optimizer, schedu
         preds_all = []
         labels_all = []
         names_all = []
+        teacher_preds_all = []  # 教师预测用于统计训练阶段IoU
 
         for i, data in enumerate(train_loader):
             running_iter = curr_iter + i + 1
@@ -213,6 +242,7 @@ def train(train_loader, train_loader_unchange, net, criterion, optimizer, schedu
             optimizer.zero_grad(set_to_none=True)
 
             with torch.amp.autocast('cuda', dtype=torch.bfloat16 if use_bf16 else torch.float16):
+                teacher_pred = None  # 每次迭代前重置
                 forward_result = net(imgs_A, imgs_B, imgs_C)
 
                 if len(forward_result) == 4:
@@ -352,19 +382,31 @@ def train(train_loader, train_loader_unchange, net, criterion, optimizer, schedu
             preds_all.append(pred_numpy)
             labels_all.append(labels_numpy)
             names_all.extend(names)
+            # 教师预测（如存在）
+            if teacher_pred is not None:
+                teacher_preds = torch.argmax(teacher_pred, dim=1)
+                teacher_preds_all.append(teacher_preds.cpu().numpy())
             # 使用 float32 标量，避免 BF16/FP16 -> numpy 转换问题
             train_loss.update(loss.detach().float().cpu().item())
 
         preds_all = np.concatenate(preds_all, axis=0)
         labels_all = np.concatenate(labels_all, axis=0)
         score_train = cm2score(get_confuse_matrix(2, labels_all, preds_all))
+        # 训练阶段教师IoU（若有教师预测）
+        score_train_teacher = None
+        if len(teacher_preds_all) > 0:
+            teacher_preds_all = np.concatenate(teacher_preds_all, axis=0)
+            score_train_teacher = cm2score(get_confuse_matrix(2, labels_all, teacher_preds_all))
 
         epoch_align_weight = (1.0 / (curr_epoch + 1)) * loss_weights['align_base_weight']
         current_lr = optimizer.param_groups[0]['lr']
         
         with open(os.path.join(args['log_dir'] + args['log_name']), 'a') as f:
-            f.write('Epoch: %d  Total time: %.1fs  Train loss %.4f  LR: %.6f  score %s\n' % (
+            f.write('Epoch: %d  Total time: %.1fs  Train loss %.4f  LR: %.6f  score %s' % (
                 curr_epoch, time.time() - begin_time, train_loss.average(), current_lr, {k: score_train[k] for k in score_train}))
+            if score_train_teacher is not None:
+                f.write('  teacher_score %s' % ({k: score_train_teacher[k] for k in score_train_teacher},))
+            f.write('\n')
             f.write('  Detailed losses: CE=%.4f, Teacher=%.4f (CE=%.4f, Dice=%.4f), KD=%.4f, FeatKD=%.4f, AlignS=%.4f, AlignT=%.4f' % (
                 train_loss_ce.average(), train_loss_teacher.average(), train_loss_teacher_ce.average(), train_loss_teacher_dice.average(), train_loss_kd.average(),
                 train_loss_feat_kd.average(), train_loss_align_student.average(), train_loss_align_teacher.average()))
@@ -381,6 +423,8 @@ def train(train_loader, train_loader_unchange, net, criterion, optimizer, schedu
 
         print('Epoch: %d  Total time: %.1fs  Train loss %.4f  LR: %.6f  score %s' % (
             curr_epoch, time.time() - begin_time, train_loss.average(), current_lr, {k: score_train[k] for k in score_train}))
+        if score_train_teacher is not None:
+            print('  teacher_score %s' % ({k: score_train_teacher[k] for k in score_train_teacher},))
         print('  Detailed losses: CE=%.4f, Teacher=%.4f (CE=%.4f, Dice=%.4f), KD=%.4f, FeatKD=%.4f, AlignS=%.4f, AlignT=%.4f' % (
             train_loss_ce.average(), train_loss_teacher.average(), train_loss_teacher_ce.average(), train_loss_teacher_dice.average(), train_loss_kd.average(),
             train_loss_feat_kd.average(), train_loss_align_student.average(), train_loss_align_teacher.average()), end='')
@@ -412,6 +456,10 @@ def train(train_loader, train_loader_unchange, net, criterion, optimizer, schedu
                 writer.add_scalar('Train/IoU_1', score_train.get('iou_1', 0.0), curr_epoch)
                 writer.add_scalar('Train/mIoU', score_train.get('miou', 0.0), curr_epoch)
                 writer.add_scalar('Train/mF1', score_train.get('mf1', 0.0), curr_epoch)
+                if score_train_teacher is not None:
+                    writer.add_scalar('Train/Teacher_IoU_1', score_train_teacher.get('iou_1', 0.0), curr_epoch)
+                    writer.add_scalar('Train/Teacher_mIoU', score_train_teacher.get('miou', 0.0), curr_epoch)
+                    writer.add_scalar('Train/Teacher_mF1', score_train_teacher.get('mf1', 0.0), curr_epoch)
             except Exception:
                 pass
 
@@ -423,7 +471,7 @@ def train(train_loader, train_loader_unchange, net, criterion, optimizer, schedu
                 vis_img = np.concatenate([pred, label], axis=1)
                 io.imsave(os.path.join(args['pred_dir'], "train_" + name), vis_img)
 
-        score_val, loss_val, val_preds, val_labels, val_names = validate(val_loader, net, criterion, curr_epoch, args)
+        score_val, loss_val, val_preds, val_labels, val_names, score_val_teacher = validate(val_loader, net, criterion, curr_epoch, args)
         # 判断是否刷新最佳指标
         improved = score_val['iou_1'] > bestiou
         if improved:
@@ -437,6 +485,7 @@ def train(train_loader, train_loader_unchange, net, criterion, optimizer, schedu
 
         # 保存 last_checkpoint（以及可能的最佳权重）
         try:
+            teacher_iou_val = score_val_teacher.get('iou_1') if score_val_teacher is not None else None
             save_checkpoint(
                 chkpt_dir=args['chkpt_dir'],
                 net=net,
@@ -448,6 +497,7 @@ def train(train_loader, train_loader_unchange, net, criterion, optimizer, schedu
                 best_loss=bestloss,
                 net_name=NET_NAME,
                 is_best=improved,
+                teacher_iou=teacher_iou_val,
             )
         except Exception:
             # 保存失败不影响训练继续
@@ -467,6 +517,10 @@ def train(train_loader, train_loader_unchange, net, criterion, optimizer, schedu
                 writer.add_scalar('Val/mIoU', score_val.get('miou', 0.0), curr_epoch)
                 writer.add_scalar('Val/mF1', score_val.get('mf1', 0.0), curr_epoch)
                 writer.add_scalar('Val/Best_IoU_1', bestiou, curr_epoch)
+                if score_val_teacher is not None:
+                    writer.add_scalar('Val/Teacher_IoU_1', score_val_teacher.get('iou_1', 0.0), curr_epoch)
+                    writer.add_scalar('Val/Teacher_mIoU', score_val_teacher.get('miou', 0.0), curr_epoch)
+                    writer.add_scalar('Val/Teacher_mF1', score_val_teacher.get('mf1', 0.0), curr_epoch)
             except Exception:
                 pass
 
@@ -485,6 +539,7 @@ def validate(val_loader, net, criterion, curr_epoch, args):
     preds_all = []
     labels_all = []
     names_all = []
+    teacher_preds_all = []  # 教师预测（若forward提供）
     for vi, data in enumerate(val_loader):
         imgs_A, imgs_B, imgs_C, labels, names = data
         if args['gpu']:
@@ -500,6 +555,7 @@ def validate(val_loader, net, criterion, curr_epoch, args):
             # 验证也使用 AMP（与训练一致）
             use_bf16 = torch.cuda.is_available() and torch.cuda.is_bf16_supported()
             with torch.amp.autocast('cuda', dtype=torch.bfloat16 if use_bf16 else torch.float16):
+                teacher_pred = None  # 每次迭代前重置
                 forward_result = net(imgs_A, imgs_B, imgs_C)
             if len(forward_result) == 4:
                 out_change, student_features, teacher_pred, teacher_features = forward_result
@@ -519,20 +575,33 @@ def validate(val_loader, net, criterion, curr_epoch, args):
         preds_all.append(pred_numpy)
         labels_all.append(labels_numpy)
         names_all.extend(names)
+        if teacher_pred is not None:
+            teacher_preds = torch.argmax(teacher_pred, dim=1)
+            teacher_preds_all.append(teacher_preds.cpu().numpy())
 
     preds_all = np.concatenate(preds_all, axis=0)
     labels_all = np.concatenate(labels_all, axis=0)
     hist = get_confuse_matrix(2, labels_all, preds_all)
     score = cm2score(hist)
+    # 教师验证分数（若有）
+    score_teacher = None
+    if len(teacher_preds_all) > 0:
+        hist_t = get_confuse_matrix(2, labels_all, np.concatenate(teacher_preds_all, axis=0))
+        score_teacher = cm2score(hist_t)
 
     curr_time = time.time() - start
     with open(os.path.join(args['log_dir'] + args['log_name']), 'a') as f:
-        f.write('Epoch: %d  %.1fs Val loss: %.2f  score: %s\n' % (
+        f.write('Epoch: %d  %.1fs Val loss: %.2f  score: %s' % (
             curr_epoch, curr_time, val_loss.average(), {k: score[k] for k in score}))
+        if score_teacher is not None:
+            f.write('  teacher_score %s' % ({k: score_teacher[k] for k in score_teacher},))
+        f.write('\n')
     print('Epoch: %d  %.1fs Val loss: %.2f  score: %s' % (
         curr_epoch, curr_time, val_loss.average(), {k: score[k] for k in score}))
+    if score_teacher is not None:
+        print('  teacher_score %s' % ({k: score_teacher[k] for k in score_teacher},))
 
-    return score, val_loss.average(), preds_all, labels_all, names_all
+    return score, val_loss.average(), preds_all, labels_all, names_all, score_teacher
 
 
 def freeze_model(model: nn.Module) -> None:

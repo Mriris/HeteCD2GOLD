@@ -23,9 +23,9 @@ os.environ['CUDA_VISIBLE_DEVICES'] = '0'
 # 说明：
 # - 若不传命令行参数，将使用这里的默认值
 # - 命令行参数依然可覆盖这些默认值
-CHECKPOINT = r'/data/jingwei/yantingxuan/0Program/HeteCD2GOLD/checkpoints/gold/trios45/EXP20251021225208MSE+DA|MultiImgPhotoMetric|PolyLR/gold_teacher_398IoU66.24.pth'
-TEST_DIR = r'/data/jingwei/yantingxuan/Datasets/CityCN/Split45/val'
-OUTPUT_DIR = r'/data/jingwei/yantingxuan/0Program/HeteCD2GOLD/results'
+CHECKPOINT = r'/data/jingwei/yantingxuan/0Program/HeteCD2GOLD/checkpoints/gold/trios43/EXP20251022211231MSE+DA|MultiImgPhotoMetric|PolyLR/gold_teacher_282IoU64.27.pth'
+TEST_DIR = r'/data/jingwei/yantingxuan/Datasets/CityCN/Split45/test'
+OUTPUT_DIR = r'/data/jingwei/yantingxuan/0Program/HeteCD2GOLD/results4'
 BATCH_SIZE = 4
 DEVICE = 'cuda'
 INPUT_SIZE = 512  # 用于 FLOPs 计算的输入尺寸
@@ -315,30 +315,34 @@ def load_model(checkpoint_path, device='cuda', force_teacher=None):
         base_dir = os.path.dirname(checkpoint_path)
         complete_checkpoint = None
         
-        # 优先使用 best_checkpoint.pth
-        best_path = os.path.join(base_dir, 'best_checkpoint.pth')
-        if os.path.exists(best_path):
-            complete_checkpoint = best_path
-        else:
-            # 查找同epoch的完整权重
-            filename = os.path.basename(checkpoint_path)
-            # 从 gold_teacher_398IoU66.24.pth 提取 epoch
-            import re
-            match = re.search(r'teacher_(\d+)IoU', filename)
-            if match:
-                epoch_num = match.group(1)
-                # 查找对应的学生权重
-                student_pattern = f"gold_{epoch_num}IoU*.pth"
-                import glob
-                candidates = glob.glob(os.path.join(base_dir, student_pattern.replace('*', '[0-9]*')))
-                if candidates:
-                    complete_checkpoint = candidates[0]
+        # 优先查找同epoch的完整权重（最重要！）
+        filename = os.path.basename(checkpoint_path)
+        # 从 gold_teacher_282IoU64.27.pth 提取 epoch
+        import re
+        match = re.search(r'teacher_(\d+)IoU', filename)
+        if match:
+            epoch_num = match.group(1)
+            # 查找对应的学生权重
+            student_pattern = f"gold_{epoch_num}IoU*.pth"
+            import glob
+            candidates = glob.glob(os.path.join(base_dir, student_pattern.replace('*', '[0-9.]*')))
+            if candidates:
+                complete_checkpoint = candidates[0]
+                print(f"  找到同 epoch ({epoch_num}) 的学生权重: {os.path.basename(complete_checkpoint)}")
         
-        # 如果找不到，使用 last_checkpoint
+        # 次选：best_checkpoint.pth
+        if complete_checkpoint is None:
+            best_path = os.path.join(base_dir, 'best_checkpoint.pth')
+            if os.path.exists(best_path):
+                complete_checkpoint = best_path
+                print(f"  未找到同 epoch 权重，使用 best_checkpoint.pth")
+        
+        # 最后：last_checkpoint
         if complete_checkpoint is None:
             last_path = os.path.join(base_dir, 'last_checkpoint.pth')
             if os.path.exists(last_path):
                 complete_checkpoint = last_path
+                print(f"  使用 last_checkpoint.pth")
         
         if complete_checkpoint:
             print(f"  使用完整权重初始化: {os.path.basename(complete_checkpoint)}")

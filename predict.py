@@ -181,6 +181,7 @@ class PredOptions():
         parser.add_argument('--pred_dir', type=str, default='/data/jingwei/yantingxuan/0Program/HeteCD2GOLD/results0', help='directory to output masks')
         parser.add_argument('--chkpt_path', type=str, default='/data/jingwei/yantingxuan/0Program/HeteCD2GOLD/checkpoints/HeteCD/gold43/EXP20250920171943/HeteCD_375IoU59.62', help='path to checkpoint')
         parser.add_argument('--save_error', action='store_true', default=True, help='save error visualization')
+        parser.add_argument('--input_size', type=int, default=512, help='input size for FLOPs calculation')
         self.initialized = True
         return parser
 
@@ -196,6 +197,51 @@ class PredOptions():
         return self.opt
 
 
+def count_parameters(model):
+    """
+    计算模型参数量
+    
+    参数:
+        model: PyTorch 模型
+        
+    返回:
+        参数量（单位：百万）
+    """
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    return total_params / 1e6, trainable_params / 1e6
+
+
+def calculate_flops(model, input_shape=(1, 3, 512, 512), device='cuda'):
+    """
+    计算模型 FLOPs
+    
+    参数:
+        model: PyTorch 模型
+        input_shape: 输入张量形状 (B, C, H, W)
+        device: 运行设备
+        
+    返回:
+        FLOPs（单位：十亿）
+    """
+    try:
+        from thop import profile
+        # 创建两个输入（img_A, img_B）
+        inputs = (
+            torch.randn(input_shape).to(device),
+            torch.randn(input_shape).to(device)
+        )
+        flops, params = profile(model, inputs=inputs, verbose=False)
+        return flops / 1e9  # 转换为 G
+    except ImportError:
+        print("警告: 未安装 thop 库，无法计算 FLOPs")
+        print("请运行: pip install thop")
+        return -1
+    except Exception as e:
+        print(f"警告: 计算 FLOPs 时出错: {e}")
+        return -1
+
+
 def main():
     begin_time = time.time()
     opt = PredOptions().parse()
@@ -208,11 +254,69 @@ def main():
 
     net.eval()
 
-
-
-    predict(net, opt.test_dir, opt.pred_dir, save_error=opt.save_error)
+    # 计算模型复杂度
+    print("\n" + "="*70)
+    print("模型复杂度分析")
+    print("="*70)
+    
+    total_params, trainable_params = count_parameters(net)
+    print(f"总参数量: {total_params:.2f}M")
+    print(f"可训练参数量: {trainable_params:.2f}M")
+    
+    print("\n计算 FLOPs...")
+    flops = calculate_flops(net, input_shape=(1, 3, opt.input_size, opt.input_size), device='cuda')
+    if flops > 0:
+        print(f"FLOPs: {flops:.2f}G (输入尺寸: {opt.input_size}x{opt.input_size})")
+    
+    # 执行预测
+    preds_all, labels_all = predict(net, opt.test_dir, opt.pred_dir, save_error=opt.save_error)
+    
+    # 计算评估指标
+    print("\n" + "="*70)
+    print("评估指标")
+    print("="*70)
+    
+    hist = get_confuse_matrix(2, labels_all, preds_all)
+    metrics = cm2score(hist)
+    
+    # 提取变化类指标
+    precision = metrics['precision_1'] * 100  # 变化类精确率
+    recall = metrics['recall_1'] * 100  # 变化类召回率
+    f1 = metrics['F1_1'] * 100  # 变化类F1
+    iou = metrics['iou_1'] * 100  # 变化类IoU
+    
+    # 打印表格
+    print("\n综合性能指标表:")
+    print("-" * 100)
+    print(f"{'Method':<15} | {'Precision':<10} | {'Recall':<10} | {'F1':<10} | {'IoU':<10} | {'Params(M)':<12} | {'FLOPs(G)':<12}")
+    print("-" * 100)
+    
+    flops_str = f"{flops:.2f}" if flops > 0 else "N/A"
+    
+    print(f"{'HeteCD':<15} | {precision:>9.2f}% | {recall:>9.2f}% | {f1:>9.2f}% | {iou:>9.2f}% | {total_params:>11.2f} | {flops_str:>11}")
+    print("-" * 100)
+    
+    # 打印详细指标
+    print(f"\n详细指标:")
+    print(f"  整体准确率 (Accuracy): {metrics['acc']*100:.2f}%")
+    print(f"  平均IoU (mIoU): {metrics['miou']*100:.2f}%")
+    print(f"  平均F1分数 (mF1): {metrics['mf1']*100:.2f}%")
+    
+    print(f"\n  类别IoU:")
+    print(f"    背景 (IoU_0): {metrics['iou_0']*100:.2f}%")
+    print(f"    变化 (IoU_1): {metrics['iou_1']*100:.2f}%")
+    
+    print(f"\n  类别F1:")
+    print(f"    背景 (F1_0): {metrics['F1_0']*100:.2f}%")
+    print(f"    变化 (F1_1): {metrics['F1_1']*100:.2f}%")
+    
+    print(f"\n  精确率和召回率:")
+    print(f"    变化类精确率: {metrics['precision_1']*100:.2f}%")
+    print(f"    变化类召回率: {metrics['recall_1']*100:.2f}%")
+    
     time_use = time.time() - begin_time
-    print('Total time: %.2fs' % time_use)
+    print(f'\n总耗时: {time_use:.2f}s')
+    print(f"结果已保存至: {opt.pred_dir}")
 
 
 def load_images_from_folder(folder):
@@ -275,10 +379,9 @@ def predict(net, test_dir, pred_dir, save_error=True):
     
     preds_all = np.concatenate(preds_all, axis=0)
     labels_all = np.concatenate(labels_all, axis=0)//255
-
     
-    hist = get_confuse_matrix(2,labels_all,preds_all)
-    score = cm2score(hist)
-    print(score)
+    return preds_all, labels_all
+
+
 if __name__ == '__main__':
     main()

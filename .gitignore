@@ -4,3 +4,9 @@ checkpoints/
 .idea/
 doc/personal/
 AGENTS.md
+open-cd/
+*.log*
+.triton_cache/
+.extra_libs/
+/results*
+.cursor

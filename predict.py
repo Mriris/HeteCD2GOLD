@@ -14,6 +14,7 @@ from scipy.spatial.distance import euclidean
 from scipy.stats import entropy, wasserstein_distance
 from scipy.special import rel_entr
 import seaborn as sns
+from tqdm import tqdm
 from utils.utils import accuracy, SCDD_eval_all, AverageMeter, get_confuse_matrix, cm2score
 DATA_NAME = 'ST'
 import torch
@@ -132,6 +133,43 @@ def compute_feature_distances(tensor1, tensor2):
     }
 
     return results
+
+
+def create_error_visualization(pred, label):
+    """
+    创建误差可视化图像
+    
+    参数:
+        pred: 预测结果 (H, W)，值为 0 或 1
+        label: 真值标签 (H, W)，值为 0 或 1
+        
+    返回:
+        可视化图像 (H, W, 3)，BGR格式
+        - 白色: 正确预测的变化区域
+        - 红色: 假阳性（预测为1，实际为0）
+        - 绿色: 假阴性（预测为0，实际为1）
+        - 黑色: 正确的背景
+    """
+    h, w = pred.shape
+    vis = np.zeros((h, w, 3), dtype=np.uint8)
+    
+    # 正确的变化区域（白色）
+    correct_change = (pred == 1) & (label == 1)
+    vis[correct_change] = [255, 255, 255]
+    
+    # 假阳性（红色）- 预测为变化但实际未变化
+    false_positive = (pred == 1) & (label == 0)
+    vis[false_positive] = [0, 0, 255]  # BGR: 红色
+    
+    # 假阴性（绿色）- 预测为未变化但实际变化
+    false_negative = (pred == 0) & (label == 1)
+    vis[false_negative] = [0, 255, 0]  # BGR: 绿色
+    
+    # 正确的背景保持黑色
+    
+    return vis
+
+
 class PredOptions():
     def __init__(self):
         self.initialized = False
@@ -139,9 +177,10 @@ class PredOptions():
     def initialize(self, parser):
         working_path = os.path.dirname(os.path.abspath(__file__))
         parser.add_argument('--pred_batch_size', type=int, default=1, help='prediction batch size')
-        parser.add_argument('--test_dir', type=str, default='/data/jingwei/HeteCD/data/xiongan_data_old/test/', help='directory to test images')
-        parser.add_argument('--pred_dir', type=str, default='/data/jingwei/HeteCD/res', help='directory to output masks')
-        parser.add_argument('--chkpt_path', type=str, default='checkpoints/cdsc_2b_3D_decoder_atten/xiongan/aloss+klloss+data_argu20240703130032/cdsc_2b_3D_decoder_atten_113IoU67.59', help='path to checkpoint')
+        parser.add_argument('--test_dir', type=str, default='/data/jingwei/yantingxuan/Datasets/CityCN/Split45/test', help='directory to test images')
+        parser.add_argument('--pred_dir', type=str, default='/data/jingwei/yantingxuan/0Program/HeteCD2GOLD/results0', help='directory to output masks')
+        parser.add_argument('--chkpt_path', type=str, default='/data/jingwei/yantingxuan/0Program/HeteCD2GOLD/checkpoints/HeteCD/gold43/EXP20250920171943/HeteCD_375IoU59.62', help='path to checkpoint')
+        parser.add_argument('--save_error', action='store_true', default=True, help='save error visualization')
         self.initialized = True
         return parser
 
@@ -171,7 +210,7 @@ def main():
 
 
 
-    predict(net, opt.test_dir, opt.pred_dir)
+    predict(net, opt.test_dir, opt.pred_dir, save_error=opt.save_error)
     time_use = time.time() - begin_time
     print('Total time: %.2fs' % time_use)
 
@@ -192,12 +231,14 @@ def load_images_from_folder(folder):
     return images_A, images_B, labels, filenames
 
 
-def predict(net, test_dir, pred_dir):
+def predict(net, test_dir, pred_dir, save_error=True):
     images_A, images_B, labels, filenames = load_images_from_folder(test_dir)
     preds_all = []
     labels_all = []
-    i = 0
-    for img_A, img_B, label, filename in zip(images_A, images_B, labels, filenames):
+    
+    for img_A, img_B, label, filename in tqdm(zip(images_A, images_B, labels, filenames), 
+                                                total=len(filenames), 
+                                                desc='预测进度'):
         img_A = FF.to_tensor(img_A).cuda().float().unsqueeze(0)
         img_B = FF.to_tensor(img_B).cuda().float().unsqueeze(0)
         
@@ -211,15 +252,26 @@ def predict(net, test_dir, pred_dir):
             pred_numpy = preds[0].cpu().numpy().astype(np.uint8)
             # pred_numpy = preds.cpu().numpy()
             labels_numpy = label[np.newaxis, ...]
-            print(i)
-            i+=1
             #print(np.unique(labels_numpy))
             preds_all.append(pred_numpy[np.newaxis, ...])
             labels_all.append(labels_numpy)
         if not os.path.exists(pred_dir):
             os.makedirs(pred_dir)
+        
+        # 保存预测结果
         save_path = os.path.join(pred_dir, filename)
         cv2.imwrite(save_path, pred_numpy * 255)
+        
+        # 保存误差可视化图
+        if save_error:
+            # 标准化标签为0/1二值
+            label_binary = (label > 127).astype(np.uint8)
+            # 生成误差图
+            error_vis = create_error_visualization(pred_numpy, label_binary)
+            # 保存误差图
+            error_filename = os.path.splitext(filename)[0] + '_error.png'
+            error_path = os.path.join(pred_dir, error_filename)
+            cv2.imwrite(error_path, error_vis)
     
     preds_all = np.concatenate(preds_all, axis=0)
     labels_all = np.concatenate(labels_all, axis=0)//255

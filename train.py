@@ -16,7 +16,7 @@ working_path = os.path.dirname(os.path.abspath(__file__))
 from utils.utils_fit import train
 from utils.loss import CrossEntropyLoss2d, weighted_BCE_logits, ChangeSimilarity,SCA_Loss,FeatureConsistencyLoss
 from utils.utils import accuracy, SCDD_eval_all, AverageMeter, get_confuse_matrix, cm2score
-os.environ['CUDA_VISIBLE_DEVICES'] = '1'
+os.environ['CUDA_VISIBLE_DEVICES'] = '2'
 #Data and model choose
 torch.set_num_threads(4)
 
@@ -44,7 +44,7 @@ def setup_seed(seed):
 setup_seed(seed)
 # from models.SSCDl import SSCDl as Net
 NET_NAME = 'gold'
-DATA_NAME = 'trios45'
+DATA_NAME = 'trios43'
 EXP_NAME = "EXP"+time.strftime('%Y%m%d%H%M%S',time.localtime(time.time()))+"MSE+DA|MultiImgPhotoMetric|PolyLR"
 ###############################################    
 #Training options
@@ -71,7 +71,7 @@ args = {
     'use_multi_img_photometric': True,
     # 断点续训相关配置：仅当提供 resume_path 时启用
     'resume_path': None,
-    # 'resume_path': r'/data/jingwei/yantingxuan/0Program/HeteCD2GOLD/checkpoints/Tgold/trios43/EXP20250929201335MSE+DA|MultiImgPhotoMetric',
+    # 'resume_path': r'/data/jingwei/yantingxuan/0Program/HeteCD2GOLD/checkpoints/gold/trios43/EXP20251022211231MSE+DA|MultiImgPhotoMetric|PolyLR',
 }
 ###############################################
 
@@ -141,25 +141,30 @@ def main():
         if os.path.isdir(ckpt_path):
             ckpt_path = os.path.join(ckpt_path, 'last_checkpoint.pth')
         if os.path.isfile(ckpt_path):
-            print(f"检测到断点文件，尝试从 {ckpt_path} 恢复训练……")
+            print(f"检测到断点/权重文件：{ckpt_path}")
         try:
             checkpoint = torch.load(ckpt_path, map_location='cuda:0')
-            # 模型权重（DataParallel 下键包含 module. 前缀）
-            model_state = checkpoint.get('model_state', None)
-            if model_state is None:
-                # 兼容仅有 state_dict 的保存
-                model_state = checkpoint
-            net.load_state_dict(model_state, strict=False)
-            # 起始 epoch 与 AMP scaler 状态传递到 args，由训练循环接收
-            args['start_epoch'] = int(checkpoint.get('epoch', -1)) + 1 if isinstance(checkpoint, dict) else 0
-            args['scaler_state'] = checkpoint.get('scaler_state', None) if isinstance(checkpoint, dict) else None
-            # 将优化器/调度器状态暂存，以便创建后恢复
-            args['optimizer_state'] = checkpoint.get('optimizer_state', None) if isinstance(checkpoint, dict) else None
-            args['scheduler_state'] = checkpoint.get('scheduler_state', None) if isinstance(checkpoint, dict) else None
-            did_resume = True
-            print(f"恢复完成：从 epoch {args.get('start_epoch', 0)} 继续训练。")
+            # 判断是'可恢复训练的checkpoint'还是'仅权重(state_dict)'
+            is_resume_ckpt = isinstance(checkpoint, dict) and ('epoch' in checkpoint) and ('model_state' in checkpoint)
+            if is_resume_ckpt:
+                # 完整断点恢复
+                model_state = checkpoint['model_state']
+                net.load_state_dict(model_state, strict=False)
+                args['start_epoch'] = int(checkpoint.get('epoch', -1)) + 1
+                args['scaler_state'] = checkpoint.get('scaler_state', None)
+                args['optimizer_state'] = checkpoint.get('optimizer_state', None)
+                args['scheduler_state'] = checkpoint.get('scheduler_state', None)
+                did_resume = True
+                print(f"恢复完成：从 epoch {args.get('start_epoch', 0)} 继续训练。")
+            else:
+                # 仅权重文件（可能是 gold_*.pth 或 gold_teacher_*.pth），作为预训练权重加载
+                # 兼容 DataParallel：键名可能含 module. 前缀
+                model_state = checkpoint if isinstance(checkpoint, dict) else checkpoint.state_dict()
+                net.load_state_dict(model_state, strict=False)
+                did_resume = False
+                print("已按预训练权重加载（不包含优化器/调度器/epoch），将从 epoch 0 开始训练。")
         except Exception as e:
-            print(f"断点恢复失败：{e}，将按预训练权重初始化。")
+            print(f"加载 {ckpt_path} 失败：{e}，将按预训练权重初始化。")
 
     if not did_resume:
         # 未恢复时，按 backbone 预训练权重映射加载

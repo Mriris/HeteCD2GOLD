@@ -10,3 +10,4 @@ open-cd/
 .extra_libs/
 /results
 .cursor
+*.bkp

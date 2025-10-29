@@ -15,5 +15,7 @@ dependencies = [
     "nvitop",
     "rasterio",
     "tensorboard",
-    "thop>=0.1.1.post2209072238",
+    "thop",
+    "scikit-learn",
+    "tsne-torch",
 ]

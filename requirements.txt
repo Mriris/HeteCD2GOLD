@@ -1,5 +1,0 @@
-scikit-image
-tensorboardX
-opencv-python
-matplotlib
-timm

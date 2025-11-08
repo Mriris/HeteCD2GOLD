@@ -21,7 +21,11 @@ from torch.utils.data import DataLoader
 working_path = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, working_path)
 
-from configs_weight_ablation import EXPERIMENT_CONFIGS, get_config
+from configs_weight_ablation import (
+    EXPERIMENT_CONFIGS_WEIGHTS, 
+    EXPERIMENT_CONFIGS_TEMPERATURE, 
+    get_config
+)
 from utils.utils_fit import train
 from utils.loss import CrossEntropyLoss2d
 from datasets import RS_ST as RS
@@ -318,8 +322,34 @@ def run_experiment(config_name):
 
 def main():
     """主函数：依次运行所有配置"""
+    # 解析命令行参数
+    exp_type = 'weights'  # 默认为权重实验
+    if len(sys.argv) > 1:
+        arg = sys.argv[1].lower()
+        if arg in ['temperature', 'temp', 't']:
+            exp_type = 'temperature'
+        elif arg in ['weights', 'weight', 'w']:
+            exp_type = 'weights'
+        else:
+            print(f"错误: 未知实验类型 '{sys.argv[1]}'")
+            print()
+            print("用法: python train_weight_ablation.py [experiment_type]")
+            print()
+            print("实验类型:")
+            print("  weights, weight, w     - 运行权重占比实验 (默认)")
+            print("  temperature, temp, t   - 运行温度敏感性实验")
+            sys.exit(1)
+    
+    # 选择实验配置
+    if exp_type == 'temperature':
+        EXPERIMENT_CONFIGS = EXPERIMENT_CONFIGS_TEMPERATURE
+        exp_name = "蒸馏温度敏感性实验"
+    else:
+        EXPERIMENT_CONFIGS = EXPERIMENT_CONFIGS_WEIGHTS
+        exp_name = "超参占比探索实验"
+    
     print("\n" + "=" * 100)
-    print("超参占比探索批量训练")
+    print(f"{exp_name}批量训练")
     print("=" * 100)
     print(f"\n将依次运行以下配置: {EXPERIMENT_CONFIGS}")
     print(f"每个配置训练 400 epochs")
@@ -341,7 +371,7 @@ def main():
             time.sleep(5)
     
     print("\n" + "=" * 100)
-    print("所有实验完成！")
+    print(f"所有{exp_name}完成！")
     print("=" * 100)
 
 

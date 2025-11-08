@@ -30,7 +30,7 @@ def print_comparison_table():
     configs = ['baseline', 'config_A', 'config_B', 'config_C']
     
     print("\n" + "=" * 140)
-    print("权重配置对比表")
+    print("一、权重占比实验配置对比表")
     print("=" * 140)
     print()
     
@@ -100,6 +100,77 @@ def print_comparison_table():
         print()
     
     print("=" * 140)
+
+
+def print_temperature_table():
+    """打印温度敏感性实验配置对比表"""
+    
+    configs = ['baseline', 'config_T1', 'config_T4', 'config_T16']
+    
+    print("\n" + "=" * 100)
+    print("二、蒸馏温度敏感性实验配置对比表")
+    print("=" * 100)
+    print()
+    
+    # 打印表头
+    header = f"{'参数名':<25}"
+    for config_name in configs:
+        config = ALL_CONFIGS[config_name]
+        display_name = config['name'][:15]
+        header += f" | {display_name:>15}"
+    print(header)
+    print("-" * 100)
+    
+    # 关键参数：温度
+    key = 'temperature'
+    row = f"{key:<25}"
+    baseline_value = ALL_CONFIGS['baseline']['loss_weights'].get(key)
+    
+    for config_name in configs:
+        config = ALL_CONFIGS[config_name]
+        value = config['loss_weights'].get(key)
+        
+        if config_name != 'baseline' and value != baseline_value:
+            display_value = f"{value} (Δ{value - baseline_value:+.0f})"
+        else:
+            display_value = str(value)
+        
+        row += f" | {display_value:>15}"
+    
+    print(row)
+    print("-" * 100)
+    print()
+    
+    # 打印预期损失占比
+    print("预期损失占比:")
+    print("-" * 100)
+    for config_name in configs:
+        config = ALL_CONFIGS[config_name]
+        print(f"  {config['name']:<30}: {config['expected_loss_ratio']}")
+    print()
+    
+    # 打印关键变化总结
+    print("=" * 100)
+    print("温度效果说明:")
+    print("=" * 100)
+    print()
+    print("  τ=1:  硬蒸馏 - 输出接近one-hot，只保留最大类别信息")
+    print("  τ=4:  适度软化 - 平衡判别性与类间关系")
+    print("  τ=8:  基线配置 - 较好的软化程度（当前默认）")
+    print("  τ=16: 强软化 - 暴露细粒度类间相似性，可能过度平滑")
+    print()
+    
+    for config_name in ['config_T1', 'config_T4', 'config_T16']:
+        config = ALL_CONFIGS[config_name]
+        print(f"【{config['name']}】")
+        print(f"  描述: {config['description']}")
+        if 'key_changes' in config:
+            print(f"  变化:")
+            for change in config['key_changes']:
+                print(f"    • {change}")
+        print()
+    
+    print("=" * 100)
 
 
 def print_simplified_table():
@@ -202,29 +273,32 @@ def export_to_csv():
 
 def main():
     """主函数"""
-    print("\n超参占比配置对比工具")
+    print("\n实验配置对比工具")
     print("=" * 100)
     
     while True:
         print("\n请选择操作:")
-        print("  1. 查看完整对比表")
-        print("  2. 查看简化对比表（仅显示变化的参数）")
-        print("  3. 导出到CSV文件")
+        print("  1. 查看权重占比实验对比表（完整）")
+        print("  2. 查看权重占比实验对比表（简化）")
+        print("  3. 查看温度敏感性实验对比表")
         print("  4. 查看所有配置详情")
+        print("  5. 导出到CSV文件")
         print("  0. 退出")
         print()
         
-        choice = input("请输入选项 (0-4): ").strip()
+        choice = input("请输入选项 (0-5): ").strip()
         
         if choice == '1':
             print_comparison_table()
         elif choice == '2':
             print_simplified_table()
         elif choice == '3':
-            export_to_csv()
+            print_temperature_table()
         elif choice == '4':
             from configs_weight_ablation import print_config_summary
             print_config_summary()
+        elif choice == '5':
+            export_to_csv()
         elif choice == '0':
             print("\n再见！")
             break
@@ -233,7 +307,8 @@ def main():
 
 
 if __name__ == '__main__':
-    # 如果直接运行，显示简化表
+    # 如果直接运行，显示权重和温度两个简化表
     print_simplified_table()
-    print("\n提示: 运行 python compare_configs.py 进入交互模式查看更多选项")
+    print_temperature_table()
+    print("\n提示: 运行时可使用交互模式查看更多选项")
 

@@ -145,6 +145,111 @@ CONFIG_C = {
 }
 
 # ================================================================================
+# 温度τ敏感性实验配置（Ablation Study for Temperature）
+# ================================================================================
+# 配置T1：低温度τ=1（硬标签，接近one-hot）
+CONFIG_T1 = {
+    'name': 'config_T1_temp1',
+    'description': '蒸馏温度τ=1（硬标签，高置信度）',
+    'loss_weights': {
+        'kd_weight': 0.005,
+        'kd_warmup_epochs': 12,
+        'kd_loss_clip': 50.0,
+        'teacher_weight': 0.12,
+        'teacher_warmup_epochs': 8,
+        'align_scale_student': 0.3,
+        'align_scale_teacher': 0.2,
+        'align_base_weight': 0.5,
+        'align_reg_scale': 0.3,
+        'temperature': 1.0,              # 关键变化：τ=1
+        'ce_class_weights': (1.0, 1.0),
+        'feat_kd_weight': 0.5,
+        'feat_kd_pos': 3.0,
+        'feat_kd_neg': 1.0,
+        'attD_enable': True,
+        'attD_weight': 0.5,
+        'attD_map_w': 0.6,
+        'attD_ch_w': 0.25,
+        'attD_sp_w': 0.15,
+        'attD_warmup_epochs': 12,
+    },
+    'expected_loss_ratio': 'CE:89% | Teacher:11% | KD:2%（硬蒸馏）',
+    'key_changes': [
+        'temperature: 8.0 → 1.0（低温，硬标签）',
+        '目标：测试硬蒸馏（接近one-hot）对知识迁移的影响',
+        '预期：可能导致蒸馏效果下降，学生难以学习到教师的不确定性',
+    ],
+}
+
+# 配置T4：中等温度τ=4（适度软化）
+CONFIG_T4 = {
+    'name': 'config_T4_temp4',
+    'description': '蒸馏温度τ=4（适度软化）',
+    'loss_weights': {
+        'kd_weight': 0.005,
+        'kd_warmup_epochs': 12,
+        'kd_loss_clip': 50.0,
+        'teacher_weight': 0.12,
+        'teacher_warmup_epochs': 8,
+        'align_scale_student': 0.3,
+        'align_scale_teacher': 0.2,
+        'align_base_weight': 0.5,
+        'align_reg_scale': 0.3,
+        'temperature': 4.0,              # 关键变化：τ=4
+        'ce_class_weights': (1.0, 1.0),
+        'feat_kd_weight': 0.5,
+        'feat_kd_pos': 3.0,
+        'feat_kd_neg': 1.0,
+        'attD_enable': True,
+        'attD_weight': 0.5,
+        'attD_map_w': 0.6,
+        'attD_ch_w': 0.25,
+        'attD_sp_w': 0.15,
+        'attD_warmup_epochs': 12,
+    },
+    'expected_loss_ratio': 'CE:89% | Teacher:11% | KD:2%（适度软化）',
+    'key_changes': [
+        'temperature: 8.0 → 4.0（中温，适度软化）',
+        '目标：测试中等软化程度对蒸馏质量的影响',
+        '预期：在硬蒸馏与过度软化之间寻找平衡点',
+    ],
+}
+
+# 配置T16：高温度τ=16（强软化）
+CONFIG_T16 = {
+    'name': 'config_T16_temp16',
+    'description': '蒸馏温度τ=16（强软化，平滑分布）',
+    'loss_weights': {
+        'kd_weight': 0.005,
+        'kd_warmup_epochs': 12,
+        'kd_loss_clip': 50.0,
+        'teacher_weight': 0.12,
+        'teacher_warmup_epochs': 8,
+        'align_scale_student': 0.3,
+        'align_scale_teacher': 0.2,
+        'align_base_weight': 0.5,
+        'align_reg_scale': 0.3,
+        'temperature': 16.0,             # 关键变化：τ=16
+        'ce_class_weights': (1.0, 1.0),
+        'feat_kd_weight': 0.5,
+        'feat_kd_pos': 3.0,
+        'feat_kd_neg': 1.0,
+        'attD_enable': True,
+        'attD_weight': 0.5,
+        'attD_map_w': 0.6,
+        'attD_ch_w': 0.25,
+        'attD_sp_w': 0.15,
+        'attD_warmup_epochs': 12,
+    },
+    'expected_loss_ratio': 'CE:89% | Teacher:11% | KD:2%（强软化）',
+    'key_changes': [
+        'temperature: 8.0 → 16.0（高温，强软化）',
+        '目标：测试高度软化对类间关系学习的影响',
+        '预期：可能过度平滑，导致判别性下降',
+    ],
+}
+
+# ================================================================================
 # 所有配置汇总
 # ================================================================================
 ALL_CONFIGS = {
@@ -152,10 +257,20 @@ ALL_CONFIGS = {
     'config_A': CONFIG_A,
     'config_B': CONFIG_B,
     'config_C': CONFIG_C,
+    'config_T1': CONFIG_T1,
+    'config_T4': CONFIG_T4,
+    'config_T16': CONFIG_T16,
 }
 
 # 实验运行顺序（不包含baseline）
-EXPERIMENT_CONFIGS = ['config_A', 'config_B', 'config_C']
+# 权重占比实验
+EXPERIMENT_CONFIGS_WEIGHTS = ['config_A', 'config_B', 'config_C']
+
+# 温度敏感性实验
+EXPERIMENT_CONFIGS_TEMPERATURE = ['config_T1', 'config_T4', 'config_T16']
+
+# 默认实验顺序（向后兼容）
+EXPERIMENT_CONFIGS = EXPERIMENT_CONFIGS_WEIGHTS
 
 
 def get_config(config_name):
@@ -168,13 +283,24 @@ def get_config(config_name):
 def print_config_summary():
     """打印所有配置的对比摘要"""
     print("=" * 100)
-    print("超参占比探索实验配置总览")
+    print("实验配置总览")
     print("=" * 100)
     print()
     
-    for config_name in ['baseline', 'config_A', 'config_B', 'config_C']:
+    # 打印baseline
+    config = ALL_CONFIGS['baseline']
+    print(f"【{config['name']}】")
+    print(f"  描述: {config['description']}")
+    print(f"  预期占比: {config['expected_loss_ratio']}")
+    print()
+    
+    # 打印权重占比实验
+    print("-" * 100)
+    print("一、权重占比实验（Weight Ablation）")
+    print("-" * 100)
+    for config_name in ['config_A', 'config_B', 'config_C']:
         config = ALL_CONFIGS[config_name]
-        print(f"【{config['name']}】")
+        print(f"\n【{config['name']}】")
         print(f"  描述: {config['description']}")
         print(f"  预期占比: {config['expected_loss_ratio']}")
         
@@ -182,11 +308,25 @@ def print_config_summary():
             print(f"  关键变化:")
             for change in config['key_changes']:
                 print(f"    - {change}")
-        
-        print()
     
-    print("=" * 100)
-    print(f"待运行实验: {EXPERIMENT_CONFIGS}")
+    # 打印温度敏感性实验
+    print("\n" + "-" * 100)
+    print("二、蒸馏温度敏感性实验（Temperature Ablation）")
+    print("-" * 100)
+    for config_name in ['config_T1', 'config_T4', 'config_T16']:
+        config = ALL_CONFIGS[config_name]
+        print(f"\n【{config['name']}】")
+        print(f"  描述: {config['description']}")
+        print(f"  预期占比: {config['expected_loss_ratio']}")
+        
+        if 'key_changes' in config:
+            print(f"  关键变化:")
+            for change in config['key_changes']:
+                print(f"    - {change}")
+    
+    print("\n" + "=" * 100)
+    print(f"权重占比实验: {EXPERIMENT_CONFIGS_WEIGHTS}")
+    print(f"温度敏感性实验: {EXPERIMENT_CONFIGS_TEMPERATURE}")
     print("=" * 100)
 
 

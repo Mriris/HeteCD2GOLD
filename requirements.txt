@@ -1,8 +1,0 @@
-scikit-image
-tensorboardX
-opencv-python
-matplotlib
-timm
-rasterio
-tensorboard
-thop

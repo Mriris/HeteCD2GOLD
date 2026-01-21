@@ -100,16 +100,3 @@ python predict.py
 ├── predict.py              # Inference and visualization
 ├── requirements.txt        # Python dependencies
 ```
-
-## Citation
-
-If you use this code in your research, please cite:
-
-```bibtex
-@article{heterocd_gold,
-  title={GOLD: Guided Online Learning for Distillation for Heterogeneous Remote Sensing Image Change Detection},
-  author={Tingxuan Yan},
-  journal={ISPRS Journal of Photogrammetry and Remote Sensing},
-  year={2025}
-}
-```

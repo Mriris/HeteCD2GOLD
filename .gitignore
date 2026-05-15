@@ -1,13 +1,44 @@
-*.pth
+# Python
 *__pycache__*
-checkpoints/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual envs
+.venv/
+venv/
+env/
+
+# IDE / 工具
 .idea/
-doc/personal/
-AGENTS.md
-open-cd/
-*.log*
+.vscode/
+.cursor
+.cursor/
+.claude/
+.ace-tool/
+
+# 训练产物 / 模型权重
+*.pth
+checkpoints/
+/results*
 .triton_cache/
 .extra_libs/
-/results*
-.cursor
+
+# 论文目录（独立私有仓库，不在公开根仓中追踪）
+article/
+
+# 第三方 / 外部仓库
+open-cd/
+AGENTS.md
+
+# 压缩包
+*.zip
+
+# 日志与备份
+*.log*
 *.bkp

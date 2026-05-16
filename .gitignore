@@ -35,6 +35,7 @@ article/
 # 第三方 / 外部仓库
 open-cd/
 AGENTS.md
+.aris
 
 # 压缩包
 *.zip
